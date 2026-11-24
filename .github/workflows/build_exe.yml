@@ -20,7 +20,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconsole --onefile --clean --collect-all imageio_ffmpeg --collect-all _sounddevice_data --name "ProCam_Windows" pro_camera_win.py
+          pyinstaller --noconsole --onefile --clean --collect-all imageio_ffmpeg --collect-all _sounddevice_data --name "ProCam_Windows" ProCameraWindows.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
