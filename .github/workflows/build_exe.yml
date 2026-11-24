@@ -1,0 +1,29 @@
+name: Build ProCam Windows EXE
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 opencv-python numpy Pillow sounddevice imageio-ffmpeg pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconsole --onefile --clean --collect-all imageio_ffmpeg --collect-all _sounddevice_data --name "ProCam_Windows" pro_camera_win.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProCam_Windows_EXE
+          path: dist/ProCam_Windows.exe
