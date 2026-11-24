@@ -20,8 +20,11 @@ from PyQt6.QtWidgets import (
     QDialog, QListWidget, QListWidgetItem, QMessageBox, QSizePolicy,
     QButtonGroup, QTabWidget, QFileDialog
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QFont
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF
+from PyQt6.QtGui import (
+    QImage, QPixmap, QFont, QIcon,
+    QPainter, QPainterPath, QLinearGradient, QColor, QPen
+)
 
 try:
     from PIL import Image
@@ -44,7 +47,7 @@ except Exception:
 
 
 # ==========================================
-# Storage Directories
+# Storage Directories & Resource Helper
 # ==========================================
 BASE_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "ProCam_Windows")
 DIRS = {
@@ -58,43 +61,40 @@ for d in DIRS.values():
     os.makedirs(d, exist_ok=True)
 
 
+def resource_path(filename):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
+
+
 # ==========================================
 # Android Motion Photo (MVIMG) Engine
-# Compatible with Google Photos & Xiaomi/HyperOS Gallery
 # ==========================================
 def build_exif_app1_xiaomi(dt_str=None):
-    """Builds a minimal EXIF APP1 segment including Xiaomi Motion Photo tag 0x8897 = 1."""
     if dt_str is None:
         dt_str = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
-    make_b = b"ProCam\x00"              # 7 bytes (+1 pad = 8)
-    model_b = b"ProCam Windows\x00"     # 15 bytes (+1 pad = 16)
-    dt_b = dt_str.encode("ascii") + b"\x00"  # 20 bytes
+    make_b = b"ProCam\x00"
+    model_b = b"ProCam Windows\x00"
+    dt_b = dt_str.encode("ascii") + b"\x00"
 
     make_off = 62
     model_off = 70
     dt_off = 86
     exif_ifd_off = 106
 
-    # Little-endian TIFF header (8 bytes)
     header = b"II" + struct.pack("<HI", 42, 8)
-
-    # IFD0: 4 entries (2 + 48 + 4 = 54 bytes -> 8..62)
     ifd0 = struct.pack("<H", 4)
-    ifd0 += struct.pack("<HHII", 0x010F, 2, len(make_b), make_off)       # Make
-    ifd0 += struct.pack("<HHII", 0x0110, 2, len(model_b), model_off)     # Model
-    ifd0 += struct.pack("<HHII", 0x0132, 2, len(dt_b), dt_off)           # DateTime
-    ifd0 += struct.pack("<HHII", 0x8769, 4, 1, exif_ifd_off)             # ExifIFDPointer
+    ifd0 += struct.pack("<HHII", 0x010F, 2, len(make_b), make_off)
+    ifd0 += struct.pack("<HHII", 0x0110, 2, len(model_b), model_off)
+    ifd0 += struct.pack("<HHII", 0x0132, 2, len(dt_b), dt_off)
+    ifd0 += struct.pack("<HHII", 0x8769, 4, 1, exif_ifd_off)
     ifd0 += struct.pack("<I", 0)
 
-    # String data block (44 bytes -> 62..106)
     data_block = make_b + b"\x00" + model_b + b"\x00" + dt_b
 
-    # Exif SubIFD: 3 entries (starts at 106)
     exif_ifd = struct.pack("<H", 3)
-    # Xiaomi Gallery Live Photo identifier: Tag 0x8897 (BYTE, count=1, value=1)
     exif_ifd += struct.pack("<HHI", 0x8897, 1, 1) + struct.pack("<B3x", 1)
-    exif_ifd += struct.pack("<HHII", 0x9003, 2, len(dt_b), dt_off)       # DateTimeOriginal
-    exif_ifd += struct.pack("<HHII", 0x9004, 2, len(dt_b), dt_off)       # DateTimeDigitized
+    exif_ifd += struct.pack("<HHII", 0x9003, 2, len(dt_b), dt_off)
+    exif_ifd += struct.pack("<HHII", 0x9004, 2, len(dt_b), dt_off)
     exif_ifd += struct.pack("<I", 0)
 
     tiff = header + ifd0 + data_block + exif_ifd
@@ -103,7 +103,6 @@ def build_exif_app1_xiaomi(dt_str=None):
 
 
 def build_motion_photo_xmp_app1(mp4_size, timestamp_us):
-    """Builds Google Motion Photo 1.0 (Container:Directory) + Legacy GCamera MicroVideo XMP APP1."""
     xmp_xml = (
         '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
         '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.1.0-jc003">\n'
@@ -147,7 +146,6 @@ def build_motion_photo_xmp_app1(mp4_size, timestamp_us):
 
 
 def pack_android_motion_photo(still_bgr, mp4_path, output_mvimg_path, keyframe_us=1500000):
-    """Packs a BGR still frame + MP4 video into a single-file Android Motion Photo (MVIMG_*.jpg)."""
     ok, enc = cv2.imencode(".jpg", still_bgr, [cv2.IMWRITE_JPEG_QUALITY, 96])
     if not ok:
         raise RuntimeError("Failed to encode still JPEG")
@@ -162,7 +160,6 @@ def pack_android_motion_photo(still_bgr, mp4_path, output_mvimg_path, keyframe_u
     exif_app1 = build_exif_app1_xiaomi()
     xmp_app1 = build_motion_photo_xmp_app1(mp4_size, int(max(0, keyframe_us)))
 
-    # Insert EXIF + XMP right after SOI (\xFF\xD8) and optional APP0 JFIF (\xFF\xE0)
     insert_pos = 2
     if len(jpg_bytes) > 6 and jpg_bytes[2:4] == b"\xFF\xE0":
         app0_len = struct.unpack(">H", jpg_bytes[4:6])[0]
@@ -170,7 +167,6 @@ def pack_android_motion_photo(still_bgr, mp4_path, output_mvimg_path, keyframe_u
 
     final_jpg = jpg_bytes[:insert_pos] + exif_app1 + xmp_app1 + jpg_bytes[insert_pos:]
 
-    # Atomic write: [JPEG + EXIF(0x8897) + XMP] + [MP4 bytes]
     tmp_out = output_mvimg_path + ".tmp"
     with open(tmp_out, "wb") as f:
         f.write(final_jpg)
@@ -180,15 +176,12 @@ def pack_android_motion_photo(still_bgr, mp4_path, output_mvimg_path, keyframe_u
 
 
 def find_embedded_mp4_offset(jpg_path):
-    """Returns byte start index of embedded MP4 inside an Android Motion Photo, or None."""
     try:
         file_size = os.path.getsize(jpg_path)
         if file_size < 1024:
             return None
         with open(jpg_path, "rb") as f:
             head = f.read(min(file_size, 65536))
-
-            # 1. Check XMP MicroVideoOffset or Container Item:Length
             offset_val = None
             m1 = re.search(rb'MicroVideoOffset="(\d+)"', head)
             if m1:
@@ -206,7 +199,6 @@ def find_embedded_mp4_offset(jpg_path):
                 if f.read(4) == b"ftyp":
                     return start
 
-            # 2. Fallback: scan for MP4 'ftyp' box after JPEG EOI (\xFF\xD9)
             f.seek(0)
             data = f.read()
             eoi = data.find(b"\xFF\xD9")
@@ -220,7 +212,6 @@ def find_embedded_mp4_offset(jpg_path):
 
 
 def extract_embedded_mp4(jpg_path, dest_mp4_path):
-    """Extracts the embedded MP4 track from a Motion Photo JPG byte-for-byte."""
     start = find_embedded_mp4_offset(jpg_path)
     if start is None:
         return None
@@ -231,11 +222,9 @@ def extract_embedded_mp4(jpg_path, dest_mp4_path):
 
 
 # ==========================================
-# Custom 3D/1D .cube LUT Engine (Fast Trilinear Pre-Bake)
+# Custom 3D/1D .cube LUT Engine
 # ==========================================
 class CubeLUT:
-    """Loads standard Adobe .cube 3D/1D LUTs and bakes a fast 128^3 BGR lookup table."""
-
     def __init__(self, filepath):
         self.filepath = filepath
         self.name = os.path.basename(filepath)
@@ -302,7 +291,6 @@ class CubeLUT:
     def _bake_128_table(self, table, n, dmin, dmax):
         grid = 128
         lin = np.linspace(0.0, 1.0, grid, dtype=np.float32)
-
         r_n = np.clip((lin - dmin[0]) / max(1e-6, dmax[0] - dmin[0]), 0.0, 1.0) * (n - 1)
         g_n = np.clip((lin - dmin[1]) / max(1e-6, dmax[1] - dmin[1]), 0.0, 1.0) * (n - 1)
         b_n = np.clip((lin - dmin[2]) / max(1e-6, dmax[2] - dmin[2]), 0.0, 1.0) * (n - 1)
@@ -353,8 +341,6 @@ class CubeLUT:
 # Continuous Audio Ring Buffer & Recorder
 # ==========================================
 class AudioEngine:
-    """Captures continuous microphone audio for Live Photo pre/post buffer and Video recording."""
-
     def __init__(self, samplerate=44100, channels=1):
         self.samplerate = samplerate
         self.channels = channels
@@ -451,7 +437,6 @@ class AudioEngine:
 
 
 def mux_video_audio_ffmpeg(temp_video, temp_wav, final_mp4, pts_scale=1.0):
-    """Muxes OpenCV video + WAV audio into standard H.264/AAC MP4 (required by Android Motion Photo)."""
     if not FFMPEG_EXE or not os.path.exists(temp_video):
         if os.path.exists(temp_video):
             shutil.move(temp_video, final_mp4)
@@ -465,7 +450,6 @@ def mux_video_audio_ffmpeg(temp_video, temp_wav, final_mp4, pts_scale=1.0):
     if abs(pts_scale - 1.0) > 0.02:
         cmd += ["-filter:v", f"setpts={pts_scale:.5f}*PTS"]
 
-    # H.264 baseline/main yuv420p + AAC + faststart for universal Android/Google Photos playback
     cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "20"]
     if has_audio:
         cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
@@ -575,7 +559,7 @@ def apply_image_pipeline(frame, settings, active_lut):
     if settings["watermark"]:
         h, w = img.shape[:2]
         lut_tag = f"  |  LUT: {active_lut.name}" if active_lut else ""
-        text = f"PROCAM WIN PRO  |  {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}{lut_tag}"
+        text = f"PROCAM WIN BY YE  |  {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}{lut_tag}"
         scale = max(0.45, w / 1920.0 * 0.7)
         thick = max(1, int(scale * 2))
         pos = (24, h - 22)
@@ -676,8 +660,6 @@ def bgr_to_qpixmap(bgr_img, target_size=None):
 # Interactive Live Photo / MVIMG Preview Widget
 # ==========================================
 class LivePhotoLabel(QLabel):
-    """Displays still JPG; press-and-hold plays paired MP4 or embedded MVIMG video WITH audio."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -802,7 +784,7 @@ class LivePhotoLabel(QLabel):
 
 
 # ==========================================
-# Gallery & MVIMG Motion Photo Viewer Dialog
+# Gallery & MVIMG Viewer Dialog
 # ==========================================
 class GalleryDialog(QDialog):
     def __init__(self, parent=None):
@@ -880,8 +862,7 @@ class GalleryDialog(QDialog):
         if tag == "MVIMG":
             if primary not in self.extracted_cache:
                 tmp_mp4 = os.path.join(self.temp_dir, f"mv_{len(self.extracted_cache)}.mp4")
-                res = extract_embedded_mp4(primary, tmp_mp4)
-                self.extracted_cache[primary] = res
+                self.extracted_cache[primary] = extract_embedded_mp4(primary, tmp_mp4)
             return self.extracted_cache[primary]
         return sibling_vid
 
@@ -935,7 +916,7 @@ class GalleryDialog(QDialog):
         self.viewer.load_media(primary, playable)
 
         if tag == "MVIMG":
-            self.hint_label.setText("ANDROID MOTION PHOTO (Single File) — Press & Hold for motion + audio (Google Photos / Xiaomi Ready)")
+            self.hint_label.setText("ANDROID MOTION PHOTO (Single File) — Press & Hold for motion + audio")
             self.btn_play.setEnabled(True)
             self.btn_extract.setEnabled(True)
             self.btn_gif.setEnabled(True)
@@ -969,8 +950,7 @@ class GalleryDialog(QDialog):
         if tag != "MVIMG":
             return
         out_mp4 = os.path.splitext(primary)[0] + "_extracted.mp4"
-        res = extract_embedded_mp4(primary, out_mp4)
-        if res:
+        if extract_embedded_mp4(primary, out_mp4):
             QMessageBox.information(self, "MP4 Extracted", f"Extracted video to:\n{out_mp4}")
 
     def export_gif(self):
@@ -1038,7 +1018,7 @@ class ProCameraWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ProCam Windows v2.1 — MVIMG Motion Photo, Custom .cube LUT & Pro Mode")
+        self.setWindowTitle("ProCam Windows By Ye — MVIMG Motion Photo, LUT & Pro Mode")
         self.resize(1340, 810)
 
         self.cap = None
@@ -1046,7 +1026,7 @@ class ProCameraWindow(QMainWindow):
         self.current_res = (1280, 720)
         self.mode = "PRO"
         self.live_photo_enabled = True
-        self.mvimg_single_file = True  # Saves single-file MVIMG_*.jpg by default
+        self.mvimg_single_file = True
         self.mic_enabled = True
 
         self.audio_engine = AudioEngine()
@@ -1056,7 +1036,6 @@ class ProCameraWindow(QMainWindow):
         else:
             self.mic_enabled = False
 
-        # Live Photo / MVIMG buffer state
         self.live_buffer = deque(maxlen=90)
         self.live_post_capturing = False
         self.live_pre_frames = []
@@ -1066,11 +1045,9 @@ class ProCameraWindow(QMainWindow):
         self.live_end_time = 0.0
         self.live_base_path = ""
 
-        # LUT state
         self.lut_paths = {}
         self.active_lut = None
 
-        # Recording / Burst / Timer states
         self.is_recording = False
         self.video_writer = None
         self.temp_video_path = ""
@@ -1136,7 +1113,6 @@ class ProCameraWindow(QMainWindow):
         root_layout.setContentsMargins(14, 10, 14, 10)
         root_layout.setSpacing(10)
 
-        # --- Top Bar ---
         top_bar = QHBoxLayout()
 
         self.btn_live = QPushButton("◉ LIVE ON")
@@ -1149,7 +1125,6 @@ class ProCameraWindow(QMainWindow):
         self.btn_mvimg = QPushButton("MVIMG: ON")
         self.btn_mvimg.setCheckable(True)
         self.btn_mvimg.setChecked(True)
-        self.btn_mvimg.setToolTip("ON: Single-file MVIMG_*.jpg (Google Photos & Xiaomi Gallery)\nOFF: Separate JPG + MP4")
         self.btn_mvimg.clicked.connect(self.toggle_mvimg_format)
         top_bar.addWidget(self.btn_mvimg)
 
@@ -1196,7 +1171,6 @@ class ProCameraWindow(QMainWindow):
 
         root_layout.addLayout(top_bar)
 
-        # --- Middle: Preview + Right Tabbed Panel ---
         mid_layout = QHBoxLayout()
         mid_layout.setSpacing(14)
 
@@ -1319,7 +1293,7 @@ class ProCameraWindow(QMainWindow):
         pro_l.addStretch()
         self.right_tabs.addTab(pro_tab, "PRO MANUAL")
 
-        # TAB 2: CUSTOM .CUBE LUT & COLOR
+        # TAB 2: LUT & COLOR
         lut_tab = QWidget()
         lut_l = QVBoxLayout(lut_tab)
         lut_l.setSpacing(8)
@@ -1366,7 +1340,6 @@ class ProCameraWindow(QMainWindow):
         mid_layout.addWidget(self.right_tabs, stretch=1)
         root_layout.addLayout(mid_layout)
 
-        # --- Bottom Bar ---
         bottom_bar = QHBoxLayout()
 
         left_bottom = QVBoxLayout()
@@ -1477,9 +1450,6 @@ class ProCameraWindow(QMainWindow):
             QSlider::handle:horizontal { background: #f5b800; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
         """)
 
-    # ==========================================
-    # LUT Management
-    # ==========================================
     def _scan_luts_folder(self):
         self.combo_lut.blockSignals(True)
         self.combo_lut.clear()
@@ -1530,9 +1500,6 @@ class ProCameraWindow(QMainWindow):
         self.combo_lut.setCurrentIndex(0)
         self.active_lut = None
 
-    # ==========================================
-    # PRO Mode Hardware Controls
-    # ==========================================
     def on_auto_exposure_toggled(self, auto_on):
         self.settings["auto_exposure"] = auto_on
         self.slider_exp.setEnabled(not auto_on)
@@ -1613,9 +1580,6 @@ class ProCameraWindow(QMainWindow):
             slider.setValue(default_v)
         self.set_status("Color & LUT settings reset")
 
-    # ==========================================
-    # Camera & Toggles
-    # ==========================================
     def open_camera(self, index):
         self.frame_timer.stop()
         if self.is_recording:
@@ -1641,7 +1605,7 @@ class ProCameraWindow(QMainWindow):
         self.cap = cap
         self.live_buffer.clear()
         aw, ah = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | MVIMG Format: {'Single File' if self.mvimg_single_file else 'Paired'}")
+        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | MVIMG: {'ON' if self.mvimg_single_file else 'OFF'}")
         self.frame_timer.start(30)
 
     def change_resolution(self, idx):
@@ -1657,10 +1621,7 @@ class ProCameraWindow(QMainWindow):
     def toggle_mvimg_format(self, checked):
         self.mvimg_single_file = checked
         self.btn_mvimg.setText("MVIMG: ON" if checked else "MVIMG: OFF")
-        self.set_status(
-            "Output: Single-file MVIMG_*.jpg (Google Photos & Xiaomi Gallery)"
-            if checked else "Output: Paired LIVE_*.jpg + LIVE_*.mp4"
-        )
+        self.set_status("Output: Single-file MVIMG_*.jpg" if checked else "Output: Paired JPG + MP4")
 
     def toggle_mic(self, checked):
         if checked:
@@ -1701,9 +1662,6 @@ class ProCameraWindow(QMainWindow):
     def set_status(self, text):
         self.status_label.setText(text)
 
-    # ==========================================
-    # Main Frame Loop
-    # ==========================================
     def _build_hud_text(self):
         if self.mode != "PRO" and self.active_lut is None:
             return ""
@@ -1772,9 +1730,6 @@ class ProCameraWindow(QMainWindow):
         )
         self.preview_label.setPixmap(bgr_to_qpixmap(vis, self.preview_label.size()))
 
-    # ==========================================
-    # Capture Actions
-    # ==========================================
     def trigger_shutter(self):
         if self.last_clean_frame is None:
             return
@@ -1947,9 +1902,6 @@ class ProCameraWindow(QMainWindow):
         mux_video_audio_ffmpeg(temp_vid, temp_wav, final_mp4, pts_scale=pts_scale)
         self.status_signal.emit(f"Saved Video: {os.path.basename(final_mp4)}")
 
-    # ==========================================
-    # Gallery & Shortcuts
-    # ==========================================
     def open_gallery(self):
         dlg = GalleryDialog(self)
         dlg.exec()
@@ -1987,8 +1939,173 @@ class ProCameraWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# ==========================================
+# Animated Splash Screen (Zoom + Gold Sweep + Pulse)
+# ==========================================
+class AnimatedSplashScreen(QWidget):
+    def __init__(self, icon_path=""):
+        super().__init__()
+        self.icon_path = icon_path
+        self.setFixedSize(560, 355)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.SplashScreen
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.logo_pix = None
+        for fname in ("logo.jpg", "logo.png", "app_icon.ico"):
+            p = resource_path(fname)
+            if os.path.exists(p):
+                pix = QPixmap(p)
+                if not pix.isNull():
+                    self.logo_pix = pix
+                    break
+
+        self.elapsed = 0.0
+        self.duration = 2.3
+        self.progress = 0.0
+        self.opacity_val = 0.0
+        self.fading_out = False
+        self.status_text = "Initializing ProCam Engine..."
+        self.main_win = None
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(
+            screen.center().x() - self.width() // 2,
+            screen.center().y() - self.height() // 2
+        )
+        self.setWindowOpacity(0.0)
+
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self._tick)
+        self.anim_timer.start(16)
+
+    def _tick(self):
+        if self.fading_out:
+            self.opacity_val = max(0.0, self.opacity_val - 0.07)
+            self.setWindowOpacity(self.opacity_val)
+            if self.opacity_val <= 0.0:
+                self.anim_timer.stop()
+                self.close()
+                if self.main_win is not None:
+                    self.main_win.show()
+            return
+
+        self.elapsed += 0.016
+        if self.elapsed < 0.35:
+            self.opacity_val = min(1.0, self.elapsed / 0.35)
+            self.setWindowOpacity(self.opacity_val)
+        elif self.opacity_val < 1.0:
+            self.opacity_val = 1.0
+            self.setWindowOpacity(1.0)
+
+        raw_p = min(1.0, self.elapsed / self.duration)
+        self.progress = 1.0 - (1.0 - raw_p) ** 2
+
+        if self.progress < 0.30:
+            self.status_text = "Initializing ProCam Engine..."
+        elif self.progress < 0.62:
+            self.status_text = "Loading Live Photo Audio & MVIMG..."
+        elif self.progress < 0.90:
+            self.status_text = "Preparing 3D LUT & Pro Controls..."
+        else:
+            self.status_text = "Starting Camera..."
+
+        self.update()
+
+        if raw_p >= 1.0 and self.main_win is None:
+            self.status_text = "Ready!"
+            self.repaint()
+            QApplication.processEvents()
+
+            self.main_win = ProCameraWindow()
+            if self.icon_path and os.path.exists(self.icon_path):
+                self.main_win.setWindowIcon(QIcon(self.icon_path))
+            self.fading_out = True
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        w, h = self.width(), self.height()
+        rect = QRectF(4, 4, w - 8, h - 8)
+
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(rect, 22, 22)
+        painter.setClipPath(clip_path)
+
+        painter.fillRect(rect, QColor("#0c0d11"))
+
+        if self.logo_pix is not None:
+            scale = 1.0 + 0.07 * self.progress
+            float_y = math.sin(self.elapsed * 2.6) * 2.5
+
+            pw, ph = self.logo_pix.width(), self.logo_pix.height()
+            base_scale = max(w / pw, h / ph)
+            draw_w = pw * base_scale * scale
+            draw_h = ph * base_scale * scale
+            dx = (w - draw_w) / 2.0
+            dy = (h - draw_h) / 2.0 - 10.0 + float_y
+
+            painter.drawPixmap(QRectF(dx, dy, draw_w, draw_h), self.logo_pix, QRectF(0, 0, pw, ph))
+
+        sheen_cycle = (self.elapsed * 0.72) % 1.6
+        if sheen_cycle <= 1.0:
+            sx = -w * 0.4 + (w * 1.8) * sheen_cycle
+            sheen = QLinearGradient(sx - 90, 0, sx + 90, h)
+            sheen.setColorAt(0.0, QColor(255, 255, 255, 0))
+            sheen.setColorAt(0.5, QColor(255, 232, 160, 75))
+            sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillRect(rect, sheen)
+
+        btm_grad = QLinearGradient(0, h - 92, 0, h)
+        btm_grad.setColorAt(0.0, QColor(10, 11, 15, 0))
+        btm_grad.setColorAt(0.55, QColor(10, 11, 15, 205))
+        btm_grad.setColorAt(1.0, QColor(10, 11, 15, 245))
+        painter.fillRect(QRectF(0, h - 92, w, 92), btm_grad)
+
+        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        painter.setPen(QColor("#d4d6e4"))
+        painter.drawText(QRectF(28, h - 54, w - 120, 20), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.status_text)
+
+        pct_text = f"{int(self.progress * 100)}%"
+        painter.setPen(QColor("#f5b800"))
+        painter.drawText(QRectF(w - 92, h - 54, 64, 20), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, pct_text)
+
+        bar_x, bar_y, bar_w, bar_h = 28.0, h - 28.0, w - 56.0, 5.0
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 35))
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2.5, 2.5)
+
+        fill_w = max(8.0, bar_w * self.progress)
+        bar_grad = QLinearGradient(bar_x, 0, bar_x + fill_w, 0)
+        bar_grad.setColorAt(0.0, QColor("#2d9cff"))
+        bar_grad.setColorAt(0.6, QColor("#f5b800"))
+        bar_grad.setColorAt(1.0, QColor("#fff0a6"))
+        painter.setBrush(bar_grad)
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 2.5, 2.5)
+
+        painter.setClipping(False)
+        pulse = int(110 + 95 * (0.5 + 0.5 * math.sin(self.elapsed * 5.0)))
+        pen = QPen(QColor(245, 184, 0, pulse), 1.8)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, 22, 22)
+
+
 if __name__ == "__main__":
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.1")
+
     app = QApplication(sys.argv)
-    win = ProCameraWindow()
-    win.show()
+    icon_file = resource_path("app_icon.ico")
+    if os.path.exists(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
+
+    splash = AnimatedSplashScreen(icon_path=icon_file)
+    splash.show()
     sys.exit(app.exec())
