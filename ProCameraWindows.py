@@ -496,7 +496,6 @@ def kelvin_to_bgr_gains(kelvin):
 
 
 def build_exposure_lut(ev_offset, iso_val):
-    """Smooth photographic EV + ISO tone curve with highlight protection."""
     ev_gain = 2.0 ** (ev_offset * 0.55)
     iso_gain = (iso_val / 400.0) ** 0.50
     total_gain = ev_gain * iso_gain
@@ -505,20 +504,13 @@ def build_exposure_lut(ev_offset, iso_val):
     x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
     y = x * total_gain
     if total_gain > 1.0:
-        # Soft highlight roll-off to prevent harsh white clipping
         y = y / (1.0 + 0.38 * np.maximum(0.0, y - 0.65))
     return np.clip(y * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
 def apply_clean_denoise_clarity(img, prev_frame, strength=1.0):
-    """
-    Removes laptop webcam color/luminance grain while preserving edges:
-    1. Motion-adaptive temporal averaging (kills static & low-light flicker noise)
-    2. YCrCb chroma noise suppression + edge-preserving luma smoothing + micro-clarity
-    """
     out = img
 
-    # 1. Temporal Noise Reduction (motion-aware, no ghosting)
     if prev_frame is not None and prev_frame.shape == out.shape:
         diff = cv2.absdiff(out, prev_frame)
         gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
@@ -532,19 +524,15 @@ def apply_clean_denoise_clarity(img, prev_frame, strength=1.0):
             0, 255
         ).astype(np.uint8)
 
-    # 2. Chroma Grain Removal + Edge-Preserving Luma Smooth + Smart Clarity
     ycrcb = cv2.cvtColor(out, cv2.COLOR_BGR2YCrCb)
     y, cr, cb = cv2.split(ycrcb)
 
-    # Smooth purple/green color speckles heavily without softening edges
     cr = cv2.GaussianBlur(cr, (5, 5), 0)
     cb = cv2.GaussianBlur(cb, (5, 5), 0)
 
-    # Edge-preserving luminance denoise
     sigma = int(16 + 18 * strength)
     y_smooth = cv2.bilateralFilter(y, 5, sigma, sigma)
 
-    # Subtle clarity / local detail enhancement on denoised luminance
     y_blur = cv2.GaussianBlur(y_smooth, (0, 0), 1.3)
     clarity_amt = 0.28 * strength
     y_clean = cv2.addWeighted(y_smooth, 1.0 + clarity_amt, y_blur, -clarity_amt, 0)
@@ -553,22 +541,18 @@ def apply_clean_denoise_clarity(img, prev_frame, strength=1.0):
 
 
 def apply_hdr_effect(img, strength=1.0):
-    """Real-time Multi-Tone HDR: LAB CLAHE local contrast + shadow lift + natural vibrance."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
-    # Local dynamic range expansion
     clahe = cv2.createCLAHE(clipLimit=2.3, tileGridSize=(8, 8))
     l_clahe = clahe.apply(l)
 
-    # Gentle shadow lift + highlight preservation
     l_norm = l.astype(np.float32) / 255.0
     l_lifted = np.power(l_norm, 0.80) * 255.0
     l_hdr = np.clip(0.55 * l_clahe.astype(np.float32) + 0.45 * l_lifted, 0, 255).astype(np.uint8)
 
     hdr_bgr = cv2.cvtColor(cv2.merge((l_hdr, a, b)), cv2.COLOR_LAB2BGR)
 
-    # Subtle vibrance boost so HDR looks rich and clear
     hsv = cv2.cvtColor(hdr_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.14, 0, 255)
     hdr_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
@@ -581,11 +565,9 @@ def apply_hdr_effect(img, strength=1.0):
 def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
     img = frame
 
-    # 1. Mirror
     if settings["mirror"]:
         img = cv2.flip(img, 1)
 
-    # 2. Digital Zoom (1.0x - 4.0x)
     zoom = settings["zoom"]
     if zoom > 1.01:
         h, w = img.shape[:2]
@@ -593,45 +575,40 @@ def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
         x1, y1 = (w - nw) // 2, (h - nh) // 2
         img = cv2.resize(img[y1:y1 + nh, x1:x1 + nw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # 3. Real-time Denoise & Clarity (before gain/HDR so noise isn't amplified)
     temporal_next = img
     if settings["clean_enabled"] and settings["clean_strength"] > 0.05:
         img = apply_clean_denoise_clarity(img, prev_temporal, settings["clean_strength"])
         temporal_next = img
 
-    # 4. PRO Exposure (EV) & ISO / Gain (Guaranteed smooth response on all webcams)
+    # PRO Exposure (EV) & ISO / Gain (Auto = neutral 1.0x pass-through)
     ev_eff = 0.0 if settings["auto_exposure"] else settings["ev_offset"]
-    exp_lut = build_exposure_lut(ev_eff, settings["iso_val"])
+    iso_eff = 400 if settings["auto_iso"] else settings["iso_val"]
+    exp_lut = build_exposure_lut(ev_eff, iso_eff)
     if exp_lut is not None:
         img = cv2.LUT(img, exp_lut)
 
-    # 5. PRO White Balance (Kelvin 2500K - 8500K)
+    # PRO White Balance
     if not settings["auto_wb"]:
         gains = kelvin_to_bgr_gains(settings["wb_kelvin"])
         img = np.clip(img.astype(np.float32) * gains[None, None, :], 0, 255).astype(np.uint8)
 
-    # 6. HDR Mode
     if settings["hdr_enabled"]:
         img = apply_hdr_effect(img, settings["hdr_strength"])
 
-    # 7. Brightness & Contrast
     if settings["brightness"] != 0 or abs(settings["contrast"] - 1.0) > 0.01:
         img = cv2.convertScaleAbs(img, alpha=settings["contrast"], beta=settings["brightness"])
 
-    # 8. Saturation
     sat = settings["saturation"]
     if abs(sat - 1.0) > 0.01:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat, 0, 255)
         img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # 9. Extra Sharpness
     sharp = settings["sharpness"]
     if sharp > 0.01:
         blur = cv2.GaussianBlur(img, (0, 0), 1.4)
         img = cv2.addWeighted(img, 1.0 + sharp, blur, -sharp, 0)
 
-    # 10. Built-in Color Looks
     flt = settings["filter"]
     if flt == "Vivid":
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -658,11 +635,9 @@ def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
         kernel = np.array([[0.272, 0.534, 0.131], [0.349, 0.686, 0.168], [0.393, 0.769, 0.189]])
         img = np.clip(cv2.transform(img, kernel), 0, 255).astype(np.uint8)
 
-    # 11. Custom .cube 3D LUT
     if active_lut is not None and settings["lut_strength"] > 0.01:
         img = active_lut.apply(img, settings["lut_strength"])
 
-    # 12. Watermark
     if settings["watermark"]:
         h, w = img.shape[:2]
         hdr_tag = "  |  HDR" if settings["hdr_enabled"] else ""
@@ -726,7 +701,6 @@ def draw_preview_overlays(frame, settings, countdown_val, flash_alpha, live_capt
     if settings["histogram"]:
         draw_rgb_histogram(vis)
 
-    # Top-left HDR / Clean status pills
     pill_x = 16
     if settings["hdr_enabled"] and not rec_text:
         cv2.rectangle(vis, (pill_x, 16), (pill_x + 64, 42), (0, 175, 255), -1)
@@ -1129,14 +1103,14 @@ class GalleryDialog(QDialog):
 
 
 # ==========================================
-# Main ProCam Windows Application (v2.2)
+# Main ProCam Windows Application (v2.3)
 # ==========================================
 class ProCameraWindow(QMainWindow):
     status_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ProCam Windows By Ye v2.2 — HDR, Clean Denoise, Pro Mode & MVIMG")
+        self.setWindowTitle("ProCam Windows By Ye v2.3 — HDR, Clean Denoise, Pro Mode & MVIMG")
         self.resize(1180, 690)
 
         self.cap = None
@@ -1173,7 +1147,6 @@ class ProCameraWindow(QMainWindow):
         self.rec_start_time = 0.0
         self.rec_frame_count = 0
 
-        # Time-Lapse configurable settings
         self.timelapse_interval = 1.0
         self.timelapse_fps = 30.0
         self.timelapse_last_grab = 0.0
@@ -1196,19 +1169,20 @@ class ProCameraWindow(QMainWindow):
             "watermark": False,
             "grid": True,
             "timer": 0,
-            # HDR & Clean Denoise
+            # HDR & Clean Denoise (Clean OFF by default)
             "hdr_enabled": False,
             "hdr_strength": 0.85,
-            "clean_enabled": True,
+            "clean_enabled": False,
             "clean_strength": 0.85,
-            # PRO Mode (Always responsive)
+            # PRO Mode (EV, ISO, Focus, WB all AUTO by default)
             "auto_exposure": True,
-            "ev_offset": 0.0,      # -3.0 to +3.0 EV
-            "iso_val": 400,        # 100 to 3200
+            "ev_offset": 0.0,
+            "auto_iso": True,
+            "iso_val": 400,
             "auto_focus": True,
             "focus_val": 50,
             "auto_wb": True,
-            "wb_kelvin": 5500,     # 2500K to 8500K
+            "wb_kelvin": 5500,
             "histogram": True,
             "focus_peaking": False,
             "zebra": False,
@@ -1265,7 +1239,7 @@ class ProCameraWindow(QMainWindow):
 
         self.btn_clean = QPushButton("✨ Clean")
         self.btn_clean.setCheckable(True)
-        self.btn_clean.setChecked(True)
+        self.btn_clean.setChecked(False)  # OFF by default on startup
         self.btn_clean.setObjectName("CleanBtn")
         self.btn_clean.setToolTip("Real-time Grain/Noise Reduction & Clarity")
         self.btn_clean.clicked.connect(self.toggle_clean)
@@ -1328,11 +1302,12 @@ class ProCameraWindow(QMainWindow):
         self.right_tabs = QTabWidget()
         self.right_tabs.setFixedWidth(310)
 
-        # TAB 1: PRO MANUAL (All sliders ALWAYS enabled — dragging auto-switches to Manual)
+        # TAB 1: PRO MANUAL
         pro_tab = QWidget()
         pro_l = QVBoxLayout(pro_tab)
         pro_l.setSpacing(5)
 
+        # Shutter / EV
         exp_row = QHBoxLayout()
         exp_row.addWidget(QLabel("Shutter / EV"))
         self.chk_auto_exp = QCheckBox("Auto")
@@ -1346,17 +1321,22 @@ class ProCameraWindow(QMainWindow):
         pro_l.addLayout(exp_row)
 
         self.slider_exp = QSlider(Qt.Orientation.Horizontal)
-        self.slider_exp.setRange(-30, 30)  # -3.0 EV to +3.0 EV
+        self.slider_exp.setRange(-30, 30)
         self.slider_exp.setValue(0)
         self.slider_exp.valueChanged.connect(self.on_exposure_changed)
         pro_l.addWidget(self.slider_exp)
 
+        # ISO / Gain (Auto by default)
         iso_row = QHBoxLayout()
         iso_row.addWidget(QLabel("ISO / Gain"))
-        self.lbl_iso_val = QLabel("ISO 400")
+        self.chk_auto_iso = QCheckBox("Auto")
+        self.chk_auto_iso.setChecked(True)
+        self.chk_auto_iso.toggled.connect(self.on_auto_iso_toggled)
+        self.lbl_iso_val = QLabel("AUTO")
         self.lbl_iso_val.setStyleSheet("color: #f5b800; font-weight: bold;")
         iso_row.addStretch()
         iso_row.addWidget(self.lbl_iso_val)
+        iso_row.addWidget(self.chk_auto_iso)
         pro_l.addLayout(iso_row)
 
         self.slider_iso = QSlider(Qt.Orientation.Horizontal)
@@ -1366,6 +1346,7 @@ class ProCameraWindow(QMainWindow):
         self.slider_iso.valueChanged.connect(self.on_iso_changed)
         pro_l.addWidget(self.slider_iso)
 
+        # Focus
         foc_row = QHBoxLayout()
         foc_row.addWidget(QLabel("Focus (Lens)"))
         self.chk_auto_foc = QCheckBox("AF")
@@ -1384,6 +1365,7 @@ class ProCameraWindow(QMainWindow):
         self.slider_foc.valueChanged.connect(self.on_focus_changed)
         pro_l.addWidget(self.slider_foc)
 
+        # White Balance
         wb_row = QHBoxLayout()
         wb_row.addWidget(QLabel("White Balance"))
         self.chk_auto_wb = QCheckBox("AWB")
@@ -1403,7 +1385,6 @@ class ProCameraWindow(QMainWindow):
         self.slider_wb.valueChanged.connect(self.on_wb_changed)
         pro_l.addWidget(self.slider_wb)
 
-        # Clarity / Clean Strength & HDR Strength right in Pro tab
         self.sliders = {}
         self._add_slider(pro_l, "Clean / Denoise Level", "clean_strength", 0, 100, 85, lambda v: f"{v}%", lambda v: v / 100.0)
         self._add_slider(pro_l, "HDR Intensity", "hdr_strength", 0, 100, 85, lambda v: f"{v}%", lambda v: v / 100.0)
@@ -1483,7 +1464,7 @@ class ProCameraWindow(QMainWindow):
         mid_layout.addWidget(self.right_tabs, stretch=1)
         root_layout.addLayout(mid_layout, stretch=1)
 
-        # --- Time-Lapse Control Bar (Visible automatically when TIMELAPSE mode active) ---
+        # --- Time-Lapse Control Bar ---
         self.tl_bar = QFrame()
         self.tl_bar.setObjectName("TimelapseBar")
         tl_layout = QHBoxLayout(self.tl_bar)
@@ -1529,7 +1510,7 @@ class ProCameraWindow(QMainWindow):
         self.tl_bar.setVisible(False)
         root_layout.addWidget(self.tl_bar)
 
-        # --- Bottom Bar (Compact so shutter never clips) ---
+        # --- Bottom Bar ---
         bottom_bar = QHBoxLayout()
         bottom_bar.setContentsMargins(4, 2, 4, 2)
 
@@ -1540,7 +1521,7 @@ class ProCameraWindow(QMainWindow):
         self.btn_gallery.clicked.connect(self.open_gallery)
         left_bottom.addWidget(self.btn_gallery)
 
-        self.status_label = QLabel("Ready — Clean Denoise ON | Drag any Pro slider to adjust")
+        self.status_label = QLabel("Ready — ISO Auto | Clean OFF")
         self.status_label.setStyleSheet("color: #a6a7bd; font-size: 11px;")
         left_bottom.addWidget(self.status_label)
         bottom_bar.addLayout(left_bottom)
@@ -1731,18 +1712,33 @@ class ProCameraWindow(QMainWindow):
             self.on_exposure_changed(self.slider_exp.value())
 
     def on_exposure_changed(self, raw_val):
-        # Dragging slider automatically switches to Manual EV
         if self.chk_auto_exp.isChecked():
             self.chk_auto_exp.blockSignals(True)
             self.chk_auto_exp.setChecked(False)
             self.chk_auto_exp.blockSignals(False)
         self.settings["auto_exposure"] = False
-        ev = raw_val / 10.0  # -3.0 to +3.0 EV
+        ev = raw_val / 10.0
         self.settings["ev_offset"] = ev
         shutter_denom = max(4, min(1000, int(round(60.0 / (2.0 ** ev)))))
         self.lbl_exp_val.setText(f"1/{shutter_denom}s ({ev:+.1f}EV)")
 
+    def on_auto_iso_toggled(self, auto_on):
+        self.settings["auto_iso"] = auto_on
+        if auto_on:
+            self.slider_iso.blockSignals(True)
+            self.slider_iso.setValue(400)
+            self.slider_iso.blockSignals(False)
+            self.settings["iso_val"] = 400
+            self.lbl_iso_val.setText("AUTO")
+        else:
+            self.on_iso_changed(self.slider_iso.value())
+
     def on_iso_changed(self, iso):
+        if self.chk_auto_iso.isChecked():
+            self.chk_auto_iso.blockSignals(True)
+            self.chk_auto_iso.setChecked(False)
+            self.chk_auto_iso.blockSignals(False)
+        self.settings["auto_iso"] = False
         self.settings["iso_val"] = iso
         self.lbl_iso_val.setText(f"ISO {iso}")
 
@@ -1791,9 +1787,13 @@ class ProCameraWindow(QMainWindow):
 
     def reset_hardware_pro(self):
         self.chk_auto_exp.setChecked(True)
+        self.chk_auto_iso.setChecked(True)
         self.chk_auto_foc.setChecked(True)
         self.chk_auto_wb.setChecked(True)
-        self.slider_iso.setValue(400)
+        self.on_auto_exposure_toggled(True)
+        self.on_auto_iso_toggled(True)
+        self.on_auto_focus_toggled(True)
+        self.on_auto_wb_toggled(True)
         self.set_status("Pro Manual controls reset to Auto")
 
     def reset_color_settings(self):
@@ -1833,7 +1833,7 @@ class ProCameraWindow(QMainWindow):
         self.cap = cap
         self.live_buffer.clear()
         aw, ah = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | Clean Denoise ON")
+        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | ISO Auto | Clean OFF")
         self.frame_timer.start(30)
 
     def change_resolution(self, idx):
@@ -1857,7 +1857,7 @@ class ProCameraWindow(QMainWindow):
     def toggle_clean(self, checked):
         self.settings["clean_enabled"] = checked
         self.prev_temporal_frame = None
-        self.set_status("Clean Denoise & Clarity ON" if checked else "Clean Denoise OFF (Raw Sensor)")
+        self.set_status("Clean Denoise & Clarity ON" if checked else "Clean Denoise OFF")
 
     def toggle_mic(self, checked):
         if checked:
@@ -1908,10 +1908,10 @@ class ProCameraWindow(QMainWindow):
         if self.mode != "PRO" and self.active_lut is None and not self.settings["hdr_enabled"]:
             return ""
         ev_txt = "AUTO" if self.settings["auto_exposure"] else f"{self.settings['ev_offset']:+.1f}EV"
-        iso = f"ISO {self.settings['iso_val']}"
+        iso = "ISO AUTO" if self.settings["auto_iso"] else f"ISO {self.settings['iso_val']}"
         wb = "AWB" if self.settings["auto_wb"] else f"{self.settings['wb_kelvin']}K"
         hdr = "HDR ON" if self.settings["hdr_enabled"] else "HDR OFF"
-        cln = f"CLEAN {int(self.settings['clean_strength']*100)}%" if self.settings["clean_enabled"] else "RAW"
+        cln = f"CLEAN {int(self.settings['clean_strength']*100)}%" if self.settings["clean_enabled"] else "CLEAN OFF"
         lut = f"LUT: {self.active_lut.name}" if self.active_lut else "LUT: OFF"
         return f" {self.mode} | EV {ev_txt} | {iso} | WB {wb} | {hdr} | {cln} | {lut}"
 
@@ -2007,11 +2007,9 @@ class ProCameraWindow(QMainWindow):
             self.start_recording()
 
     def _polish_still_frame(self, frame):
-        """Extra multi-detail polish for saved still photos when Clean mode is active."""
         if not self.settings["clean_enabled"]:
             return frame
         try:
-            # Fast subtle NL-Means denoise for ultra-clean saved stills
             h_str = max(3, int(6 * self.settings["clean_strength"]))
             return cv2.fastNlMeansDenoisingColored(frame, None, h_str, h_str, 5, 11)
         except Exception:
@@ -2054,7 +2052,7 @@ class ProCameraWindow(QMainWindow):
                 DIRS["photos"],
                 f"PRO_{ts}{suffix}.png" if is_png else f"IMG_{ts}{suffix}.jpg"
             )
-            self.set_status("Polishing & saving photo...")
+            self.set_status("Saving photo...")
             threading.Thread(
                 target=self._save_polished_still,
                 args=(frame, out_path, is_png),
@@ -2378,7 +2376,7 @@ class AnimatedSplashScreen(QWidget):
 if __name__ == "__main__":
     if os.name == "nt":
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.2")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.3")
 
     app = QApplication(sys.argv)
     icon_file = resource_path("app_icon.ico")
