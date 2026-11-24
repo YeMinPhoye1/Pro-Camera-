@@ -1,5 +1,5 @@
 import os
-# Must be set BEFORE importing cv2 so Windows 11 MSMF opens fast at max FPS
+# Must be set BEFORE importing cv2 so Windows 11 MSMF opens fast without software transform lag
 os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
 
 import sys
@@ -71,7 +71,7 @@ def resource_path(filename):
 
 
 def upscale_hq_still(frame, target_w, target_h):
-    """High-quality Lanczos4 + subtle micro-detail upscale for 2K/4K still output."""
+    """High-quality Lanczos4 + micro-detail upscale for 2K/4K still photos."""
     h, w = frame.shape[:2]
     if w >= target_w and h >= target_h:
         return frame
@@ -81,10 +81,10 @@ def upscale_hq_still(frame, target_w, target_h):
 
 
 # ==========================================
-# Zero-Latency Background Camera Thread (60 FPS + 2K/4K Capable)
+# Smart Zero-Latency Camera Thread (Auto-Negotiates Max Smooth FPS)
 # ==========================================
 class CameraReader(threading.Thread):
-    def __init__(self, index, width, height, target_fps=30, backend_name="MSMF"):
+    def __init__(self, index, width, height, target_fps=60, backend_name="MSMF"):
         super().__init__(daemon=True)
         self.index = index
         self.req_w = width
@@ -94,6 +94,7 @@ class CameraReader(threading.Thread):
 
         self._lock = threading.Lock()
         self._running = True
+        self._paused = False
         self._frame = None
         self._frame_id = 0
         self._frame_ts = 0.0
@@ -108,25 +109,32 @@ class CameraReader(threading.Thread):
         self.active_backend = backend_name
         self._init_done = threading.Event()
 
-    def _open_capture(self, api_flag, use_mjpg=True):
+    def _try_open(self, api_flag, w, h, fps, use_mjpg=True):
         cap = cv2.VideoCapture(self.index, api_flag)
         if not cap.isOpened():
-            return None
-
+            return None, None
         if use_mjpg:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req_w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_h)
-        cap.set(cv2.CAP_PROP_FPS, self.req_fps)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        cap.set(cv2.CAP_PROP_FPS, fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap
+
+        ret, frm = cap.read()
+        if not ret or frm is None:
+            cap.release()
+            return None, None
+        return cap, frm
 
     def set_prop(self, prop_id, value):
         with self._lock:
             self._pending_props[prop_id] = value
 
+    def set_paused(self, paused):
+        with self._lock:
+            self._paused = paused
+
     def set_fast_shutter_lock(self, enabled):
-        """Overrides webcam low-light exposure drop to unlock 30/60 FPS."""
         exp_val = -6 if self.req_fps >= 60 else -5
         if self.active_backend == "MSMF":
             if enabled:
@@ -149,31 +157,56 @@ class CameraReader(threading.Thread):
         self._running = False
 
     def run(self):
-        attempts = (
-            [("MSMF", cv2.CAP_MSMF, True), ("MSMF", cv2.CAP_MSMF, False), ("DShow", cv2.CAP_DSHOW, True), ("DShow", cv2.CAP_DSHOW, False)]
-            if self.backend_name == "MSMF"
-            else [("DShow", cv2.CAP_DSHOW, True), ("DShow", cv2.CAP_DSHOW, False), ("MSMF", cv2.CAP_MSMF, True)]
-        )
+        # Prevent asking a 1080p laptop cam for unsupported 4K/60 that drops it to slow YUY2
+        primary_api = cv2.CAP_MSMF if self.backend_name == "MSMF" else cv2.CAP_DSHOW
+        alt_api = cv2.CAP_DSHOW if self.backend_name == "MSMF" else cv2.CAP_MSMF
+        alt_name = "DShow" if self.backend_name == "MSMF" else "MSMF"
 
-        cap = None
-        first_frame = None
-        for bname, api, mjpg in attempts:
-            c = self._open_capture(api, use_mjpg=mjpg)
-            if c is None:
-                continue
-            ret, frm = c.read()
-            if ret and frm is not None:
-                cap = c
-                first_frame = frm
-                self.active_backend = bname
-                break
-            c.release()
+        # Smart negotiation order:
+        # 1. Exact requested resolution & FPS (MJPG)
+        # 2. If 2K/4K failed or sensor returned smaller size -> reopen clean 1080p/720p MJPG @ max FPS
+        # 3. Fallback to 30fps MJPG if 60fps caused low-fps driver fallback
+        cap, first_frame = self._try_open(primary_api, self.req_w, self.req_h, self.req_fps, use_mjpg=True)
+        chosen_backend = self.backend_name
+
+        if cap is not None and first_frame is not None:
+            fh, fw = first_frame.shape[:2]
+            reported_fps = cap.get(cv2.CAP_PROP_FPS) or 0
+            # If user asked for 2K/4K on a non-4K webcam, or 60fps caused driver to report <25fps:
+            need_reopen = False
+            best_w, best_h = fw, fh
+            best_fps = self.req_fps
+            if self.req_w > 1920 and fw < self.req_w:
+                # Sensor isn't native 2K/4K -> reopen cleanly at its best 1080p/720p MJPG
+                best_w, best_h = min(fw, 1920), min(fh, 1080)
+                need_reopen = True
+            if self.req_fps >= 60 and 0 < reported_fps < 25:
+                best_fps = 30
+                need_reopen = True
+
+            if need_reopen:
+                cap.release()
+                cap, first_frame = self._try_open(primary_api, best_w, best_h, best_fps, use_mjpg=True)
+
+        if cap is None:
+            for bname, api, w, h, fps, mjpg in [
+                (self.backend_name, primary_api, min(self.req_w, 1920), min(self.req_h, 1080), 30, True),
+                (self.backend_name, primary_api, 1280, 720, 30, True),
+                (self.backend_name, primary_api, 1280, 720, 30, False),
+                (alt_name, alt_api, min(self.req_w, 1920), min(self.req_h, 1080), 30, True),
+                (alt_name, alt_api, 1280, 720, 30, False),
+            ]:
+                cap, first_frame = self._try_open(api, w, h, fps, use_mjpg=mjpg)
+                if cap is not None:
+                    chosen_backend = bname
+                    break
 
         if cap is None or first_frame is None:
             self.error_msg = f"Camera {self.index} not detected."
             self._init_done.set()
             return
 
+        self.active_backend = chosen_backend
         self.actual_h, self.actual_w = first_frame.shape[:2]
         now = time.perf_counter()
         self._cam_times.append(now)
@@ -186,6 +219,12 @@ class CameraReader(threading.Thread):
 
         try:
             while self._running:
+                if self._paused:
+                    # Drain capture lightly so camera stays warm without eating CPU
+                    cap.grab()
+                    time.sleep(0.05)
+                    continue
+
                 props = None
                 with self._lock:
                     if self._pending_props:
@@ -373,11 +412,11 @@ def finalize_stream_to_mp4(temp_path, is_raw_h264, temp_wav, final_mp4, output_f
     return ok
 
 
-def encode_cfr_live_mp4(frames_with_ts, temp_wav, out_mp4, target_fps=30.0):
+def encode_smooth_cfr_live_mp4(frames_with_ts, temp_wav, out_mp4, target_fps=60.0):
     """
-    Resamples Live Photo frames onto an exact constant-FPS timeline (30 or 60 FPS)
-    matched 1:1 to real elapsed time so playback is NEVER slow-motion and stays in
-    perfect sync with audio on Windows, Google Photos, and Xiaomi Gallery.
+    Encodes Live Photo onto an exact constant-FPS timeline (30 or 60 FPS) with
+    smooth sub-frame motion interpolation so even a 20-30fps webcam produces
+    silky smooth 60fps Live Photos synced 1:1 with audio.
     """
     if len(frames_with_ts) < 2:
         return False
@@ -388,19 +427,50 @@ def encode_cfr_live_mp4(frames_with_ts, temp_wav, out_mp4, target_fps=30.0):
     total_out = max(2, int(round(duration * out_fps)))
 
     in_h, in_w = frames_with_ts[0][1].shape[:2]
+    # Keep Live Photo motion video crisp 720p/1080p max so phones & PC play it smoothly
+    if in_w > 1920:
+        scale = 1920.0 / in_w
+        in_w = 1920
+        in_h = int(in_h * scale)
     in_w &= ~1
     in_h &= ~1
 
-    # Build nearest-timestamp index list (zero extra frame memory)
     ts_arr = [t - first_ts for (t, _) in frames_with_ts]
     n_in = len(ts_arr)
-    selected_indices = []
-    ptr = 0
-    for k in range(total_out):
-        t_target = k / out_fps
-        while ptr + 1 < n_in and abs(ts_arr[ptr + 1] - t_target) <= abs(ts_arr[ptr] - t_target):
-            ptr += 1
-        selected_indices.append(ptr)
+
+    def _get_resized(idx):
+        f = frames_with_ts[idx][1]
+        if f.shape[1] != in_w or f.shape[0] != in_h:
+            return cv2.resize(f, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+        return f
+
+    def _iter_smooth_frames():
+        ptr = 0
+        cached_idx = -1
+        cached_f0 = None
+        cached_f1 = None
+        for k in range(total_out):
+            t_target = k / out_fps
+            while ptr + 1 < n_in - 1 and ts_arr[ptr + 1] < t_target:
+                ptr += 1
+
+            t0 = ts_arr[ptr]
+            t1 = ts_arr[min(ptr + 1, n_in - 1)]
+            dt = t1 - t0
+            alpha = 0.0 if dt <= 1e-4 else max(0.0, min(1.0, (t_target - t0) / dt))
+
+            if ptr != cached_idx:
+                cached_f0 = _get_resized(ptr)
+                cached_f1 = _get_resized(min(ptr + 1, n_in - 1))
+                cached_idx = ptr
+
+            if alpha < 0.16:
+                yield cached_f0
+            elif alpha > 0.84:
+                yield cached_f1
+            else:
+                # Smooth temporal blend between adjacent frames for fluid 60fps playback
+                yield cv2.addWeighted(cached_f0, 1.0 - alpha, cached_f1, alpha, 0)
 
     if FFMPEG_EXE:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -424,13 +494,10 @@ def encode_cfr_live_mp4(frames_with_ts, temp_wav, out_mp4, target_fps=30.0):
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=creationflags
             )
-            for idx in selected_indices:
-                f = frames_with_ts[idx][1]
-                if f.shape[1] != in_w or f.shape[0] != in_h:
-                    f = cv2.resize(f, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
-                proc.stdin.write(f.tobytes())
+            for frm in _iter_smooth_frames():
+                proc.stdin.write(frm.tobytes())
             proc.stdin.close()
-            proc.wait(timeout=15)
+            proc.wait(timeout=20)
             ok = (proc.returncode == 0 and os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0)
         except Exception:
             ok = False
@@ -443,11 +510,8 @@ def encode_cfr_live_mp4(frames_with_ts, temp_wav, out_mp4, target_fps=30.0):
         return ok
     else:
         writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (in_w, in_h))
-        for idx in selected_indices:
-            f = frames_with_ts[idx][1]
-            if f.shape[1] != in_w or f.shape[0] != in_h:
-                f = cv2.resize(f, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
-            writer.write(f)
+        for frm in _iter_smooth_frames():
+            writer.write(frm)
         writer.release()
         return True
 
@@ -470,11 +534,10 @@ class FastVideoView(QWidget):
         self._message = msg
         self.update()
 
-    def set_bgr_frame(self, bgr_img):
-        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        self._rgb_buf = rgb
-        self._qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+    def set_rgb_buffer(self, rgb_img):
+        h, w, ch = rgb_img.shape
+        self._rgb_buf = rgb_img
+        self._qimg = QImage(rgb_img.data, w, h, ch * w, QImage.Format.Format_RGB888)
         self.update()
 
     def paintEvent(self, event):
@@ -495,6 +558,7 @@ class FastVideoView(QWidget):
             painter.setFont(QFont("Segoe UI", 12))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._message)
 
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(QColor("#282834"), 1))
         painter.drawRect(0, 0, rect.width() - 1, rect.height() - 1)
 
@@ -1088,7 +1152,7 @@ class CachedHistogramOverlay:
 HIST_OVERLAY = CachedHistogramOverlay()
 
 
-def make_preview_frame(clean_frame, target_w, target_h, settings, countdown_val, flash_alpha, live_capturing, rec_text, hud_text):
+def make_preview_rgb(clean_frame, target_w, target_h, settings, countdown_val, flash_alpha, live_capturing, rec_text, hud_text):
     fh, fw = clean_frame.shape[:2]
     tw = max(320, min(fw, target_w))
     th = max(180, min(fh, target_h))
@@ -1153,16 +1217,16 @@ def make_preview_frame(clean_frame, target_w, target_h, settings, countdown_val,
     if flash_alpha > 0.0:
         vis = cv2.addWeighted(np.full_like(vis, 255), flash_alpha, vis, 1.0 - flash_alpha, 0)
 
-    return vis
+    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
 
 
 # ==========================================
-# Wall-Clock Synced Real-Time Live Photo Player (Zero Slow-Motion!)
+# RAM Pre-Cached Butter-Smooth Live Photo & Video Player (Yellow Bug Fixed!)
 # ==========================================
 class LivePhotoView(QWidget):
     """
-    Plays Live Photos, MVIMG, and 2K/4K 60fps videos at exact 1:1 real-time speed
-    using wall-clock sync + cap.grab() frame skipping + direct QPainter rendering.
+    Pre-caches short Live Photos (~3s) into RAM for zero-stutter 60fps instant playback,
+    and streams longer 2K/4K videos with wall-clock real-time sync.
     """
 
     def __init__(self, parent=None):
@@ -1181,52 +1245,95 @@ class LivePhotoView(QWidget):
         self.audio_pcm = None
         self.audio_sr = 44100
 
+        # RAM frame cache for Live Photos
+        self._load_gen = 0
+        self._cache_lock = threading.Lock()
+        self.cached_frames = []   # list of (rgb_np, QImage)
+        self.cached_fps = 30.0
+        self.cache_ready = False
+
         self._rgb_buf = None
         self._qimg = None
         self._message = "No Media Selected"
 
-        # 60+ Hz clock tick for silky real-time sync
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._tick_playback)
 
-    def _set_bgr(self, bgr_img):
-        # Downscale 2K/4K frames to viewport size BEFORE RGB conversion for 60fps smooth playback
+    def _bgr_to_scaled_qimg(self, bgr_img, max_w=860, max_h=540):
         fh, fw = bgr_img.shape[:2]
-        vw = max(320, self.width())
-        vh = max(200, self.height())
-        if fw > vw or fh > vh:
-            scale = min(vw / fw, vh / fh)
+        if fw > max_w or fh > max_h:
+            scale = min(max_w / fw, max_h / fh)
             nw, nh = max(64, int(fw * scale)), max(64, int(fh * scale))
             bgr_img = cv2.resize(bgr_img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-
-        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
         h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        return rgb, qimg
+
+    def _set_bgr(self, bgr_img):
+        vw = max(480, self.width())
+        vh = max(300, self.height())
+        rgb, qimg = self._bgr_to_scaled_qimg(bgr_img, vw, vh)
         self._rgb_buf = rgb
-        self._qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        self._qimg = qimg
         self.update()
 
-    def load_media(self, path, playable_video=None):
+    def load_media(self, path, playable_video=None, is_live_clip=False):
         self.stop_playback()
+        self._load_gen += 1
+        gen = self._load_gen
+
         self.still_path = path
         self.video_path = playable_video
         self.audio_pcm = None
+        with self._cache_lock:
+            self.cached_frames = []
+            self.cache_ready = False
+
         self._show_still()
 
         target_vid = playable_video or (path if path and path.lower().endswith(".mp4") else None)
-        if target_vid and HAS_AUDIO and FFMPEG_EXE and os.path.exists(target_vid):
-            threading.Thread(target=self._preload_audio, args=(target_vid,), daemon=True).start()
+        if target_vid and os.path.exists(target_vid):
+            if HAS_AUDIO and FFMPEG_EXE:
+                threading.Thread(target=self._preload_audio, args=(target_vid, gen), daemon=True).start()
+            if is_live_clip:
+                threading.Thread(target=self._preload_live_frames, args=(target_vid, gen), daemon=True).start()
 
-    def _preload_audio(self, vid_path):
+    def _preload_audio(self, vid_path, gen):
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             cmd = [FFMPEG_EXE, "-i", vid_path, "-vn", "-f", "s16le", "-ac", "1", "-ar", str(self.audio_sr), "pipe:1"]
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=creationflags)
-            if proc.returncode == 0 and proc.stdout:
-                pcm = np.frombuffer(proc.stdout, dtype=np.int16)
-                if vid_path in (self.video_path, self.still_path):
-                    self.audio_pcm = pcm
+            if proc.returncode == 0 and proc.stdout and gen == self._load_gen:
+                self.audio_pcm = np.frombuffer(proc.stdout, dtype=np.int16)
         except Exception:
             pass
+
+    def _preload_live_frames(self, vid_path, gen):
+        """Pre-decodes short Live Photo clip into RAM so Hold-to-Play runs at locked 60fps."""
+        cap = cv2.VideoCapture(vid_path)
+        if not cap.isOpened():
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps < 5 or fps > 120:
+            fps = 30.0
+        frames = []
+        max_frames = 240  # up to 4s @ 60fps
+        while len(frames) < max_frames:
+            if gen != self._load_gen:
+                cap.release()
+                return
+            ret, frm = cap.read()
+            if not ret or frm is None:
+                break
+            frames.append(self._bgr_to_scaled_qimg(frm, 820, 520))
+        cap.release()
+
+        if gen == self._load_gen and len(frames) >= 2:
+            with self._cache_lock:
+                self.cached_frames = frames
+                self.cached_fps = float(fps)
+                self.cache_ready = True
 
     def _show_still(self):
         if self.still_path and os.path.exists(self.still_path):
@@ -1264,16 +1371,26 @@ class LivePhotoView(QWidget):
         if not target_vid or not os.path.exists(target_vid):
             return
         self.stop_playback()
-        self.cap = cv2.VideoCapture(target_vid)
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps < 5 or fps > 120:
-            fps = 30.0
-        self.vid_fps = float(fps)
+
+        with self._cache_lock:
+            use_cache = self.cache_ready and len(self.cached_frames) >= 2
+            cfps = self.cached_fps
+
+        if use_cache:
+            self.vid_fps = cfps
+            self.cap = None
+        else:
+            self.cap = cv2.VideoCapture(target_vid)
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            if not fps or fps < 5 or fps > 120:
+                fps = 30.0
+            self.vid_fps = float(fps)
+
         self.playing = True
         self.cur_frame_idx = -1
         self.play_start_time = time.perf_counter()
         self._play_audio_track()
-        self.play_timer.start(14)  # ~70Hz real-time clock check
+        self.play_timer.start(11)  # ~90Hz smooth sync tick
 
     def stop_playback(self):
         self.playing = False
@@ -1290,23 +1407,41 @@ class LivePhotoView(QWidget):
             self._show_still()
 
     def _restart_loop(self):
-        if not self.cap:
-            return
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self.cur_frame_idx = -1
         self.play_start_time = time.perf_counter()
+        if self.cap is not None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self._play_audio_track()
 
     def _tick_playback(self):
-        if not self.cap or not self.playing:
+        if not self.playing:
             return
 
         elapsed = time.perf_counter() - self.play_start_time
         target_idx = int(elapsed * self.vid_fps)
+
+        # Path A: Zero-lag RAM-cached Live Photo playback
+        if self.cap is None:
+            with self._cache_lock:
+                n = len(self.cached_frames)
+                if n == 0:
+                    return
+                if target_idx >= n:
+                    self._restart_loop()
+                    target_idx = 0
+                if target_idx == self.cur_frame_idx:
+                    return
+                self.cur_frame_idx = target_idx
+                rgb, qimg = self.cached_frames[target_idx]
+            self._rgb_buf = rgb
+            self._qimg = qimg
+            self.update()
+            return
+
+        # Path B: Real-time streaming playback for long videos
         if target_idx <= self.cur_frame_idx:
             return
 
-        # Skip any behind frames via fast grab() so video NEVER goes slow-motion
         skip = target_idx - self.cur_frame_idx - 1
         for _ in range(skip):
             if not self.cap.grab():
@@ -1339,16 +1474,18 @@ class LivePhotoView(QWidget):
             if self.playing:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor("#f5b800"))
-                painter.drawRoundedRect(QRectF(dx + 14, dy + 14, 118, 28), 6, 6)
+                painter.drawRoundedRect(QRectF(dx + 14, dy + 14, 124, 28), 6, 6)
                 painter.setPen(QColor("#111116"))
                 painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
                 badge = f"LIVE {int(round(self.vid_fps))}fps" + (" 🔊" if self.audio_pcm is not None else "")
-                painter.drawText(QRectF(dx + 14, dy + 14, 118, 28), Qt.AlignmentFlag.AlignCenter, badge)
+                painter.drawText(QRectF(dx + 14, dy + 14, 124, 28), Qt.AlignmentFlag.AlignCenter, badge)
         else:
             painter.setPen(QColor("#9a9cb2"))
             painter.setFont(QFont("Segoe UI", 11))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._message)
 
+        # CRITICAL: Reset brush to NoBrush so outer border never fills the widget!
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(QColor("#2a2a33"), 1))
         painter.drawRect(0, 0, rect.width() - 1, rect.height() - 1)
 
@@ -1374,7 +1511,7 @@ class LivePhotoView(QWidget):
 class GalleryDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("ProCam Gallery — Real-Time MVIMG & 4K Viewer")
+        self.setWindowTitle("ProCam Gallery — Instant 60fps MVIMG & 4K Viewer")
         self.resize(1020, 620)
         self.temp_dir = tempfile.mkdtemp(prefix="procam_mvimg_")
         self.extracted_cache = {}
@@ -1496,9 +1633,9 @@ class GalleryDialog(QDialog):
             return
         tag, primary, sibling_vid = self.items_data[row]
         playable = self._get_playable_video(tag, primary, sibling_vid)
-        self.viewer.load_media(primary, playable)
+        is_live = tag in ("MVIMG", "LIVE")
+        self.viewer.load_media(primary, playable, is_live_clip=is_live)
 
-        # Read resolution info for display
         res_info = ""
         if primary and primary.lower().endswith((".jpg", ".png")):
             im = cv2.imread(primary)
@@ -1513,7 +1650,7 @@ class GalleryDialog(QDialog):
             res_info = f" ({vw}x{vh} @ {vfps}fps)"
 
         if tag == "MVIMG":
-            self.hint_label.setText(f"ANDROID MOTION PHOTO{res_info} — Press & Hold for real-time motion + audio")
+            self.hint_label.setText(f"ANDROID MOTION PHOTO{res_info} — Press & Hold for smooth real-time motion + audio")
             self.btn_play.setEnabled(True)
             self.btn_extract.setEnabled(True)
             self.btn_gif.setEnabled(True)
@@ -1608,18 +1745,25 @@ class GalleryDialog(QDialog):
 
 
 # ==========================================
-# Main ProCam Windows Application (v2.6 — 60fps + 2K/4K + Real-Time Live Photo)
+# Main ProCam Windows Application (v2.7 — Full Background Pipeline)
 # ==========================================
 class ProCameraWindow(QMainWindow):
     status_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ProCam Windows By Ye v2.6 — 4K UHD, 60 FPS & Real-Time MVIMG")
+        self.setWindowTitle("ProCam Windows By Ye v2.7 — Butter-Smooth 60fps & 4K Engine")
         self.resize(1220, 695)
 
         self.cam_reader = None
-        self.last_frame_id = -1
+        self._proc_thread = None
+        self._proc_running = False
+        self._proc_paused = False
+        self._render_lock = threading.Lock()
+        self._ready_rgb = None
+        self._ready_id = 0
+        self._shown_id = 0
+
         self.ui_fps_times = deque(maxlen=45)
         self.ui_fps = 0.0
         self.cam_fps = 0.0
@@ -1632,7 +1776,7 @@ class ProCameraWindow(QMainWindow):
             ("2K QHD", (2560, 1440)),
             ("4K UHD", (3840, 2160)),
         ]
-        self.current_res = (1920, 1080)
+        self.current_res = (1280, 720)   # Default 720p for max smooth 30/60 FPS on laptops
         self.target_fps = 60
 
         self.mode = "PRO"
@@ -1648,7 +1792,7 @@ class ProCameraWindow(QMainWindow):
         else:
             self.mic_enabled = False
 
-        # Holds up to ~2.0s at 60fps
+        self.capture_lock = threading.Lock()
         self.live_buffer = deque(maxlen=130)
         self.live_post_capturing = False
         self.live_pre_frames = []
@@ -1713,9 +1857,9 @@ class ProCameraWindow(QMainWindow):
 
         self.status_signal.connect(self.set_status)
 
-        # ~90Hz poll timer so 60 FPS frames never miss a beat
-        self.frame_timer = QTimer(self)
-        self.frame_timer.timeout.connect(self.update_frame)
+        # Lightweight UI paint timer (only blits pre-rendered RGB buffer -> ~0.3ms!)
+        self.paint_timer = QTimer(self)
+        self.paint_timer.timeout.connect(self._present_frame)
 
         self.countdown_timer = QTimer(self)
         self.countdown_timer.timeout.connect(self._countdown_tick)
@@ -1814,13 +1958,13 @@ class ProCameraWindow(QMainWindow):
         self.combo_res = QComboBox()
         for label, _ in self.res_options:
             self.combo_res.addItem(label)
-        self.combo_res.setCurrentIndex(1)  # Default 1080p FHD
+        self.combo_res.setCurrentIndex(0)  # Default 720p HD for instant 30/60 FPS smoothness
         self.combo_res.currentIndexChanged.connect(self.change_resolution)
         top_bar.addWidget(self.combo_res)
 
         self.combo_fps = QComboBox()
         self.combo_fps.addItems(["30 FPS", "60 FPS"])
-        self.combo_fps.setCurrentIndex(1)  # Target 60 FPS (falls back smoothly if cam is 30fps)
+        self.combo_fps.setCurrentIndex(1)
         self.combo_fps.currentIndexChanged.connect(self.change_fps)
         top_bar.addWidget(self.combo_fps)
 
@@ -2051,7 +2195,7 @@ class ProCameraWindow(QMainWindow):
         self.btn_gallery.clicked.connect(self.open_gallery)
         left_bottom.addWidget(self.btn_gallery)
 
-        self.status_label = QLabel("Ready — 2K/4K & 60fps Engine Active")
+        self.status_label = QLabel("Ready — Dual-Thread Smooth Engine")
         self.status_label.setStyleSheet("color: #a6a7bd; font-size: 11px;")
         left_bottom.addWidget(self.status_label)
         bottom_bar.addLayout(left_bottom)
@@ -2331,23 +2475,26 @@ class ProCameraWindow(QMainWindow):
         self.set_status("Color & LUT settings reset")
 
     # ==========================================
-    # Threaded Camera Lifecycle & Toggles
+    # Dual-Thread Camera & Processing Lifecycle
     # ==========================================
-    def _stop_camera_reader(self):
+    def _stop_pipeline(self):
+        self.paint_timer.stop()
+        self._proc_running = False
+        if self._proc_thread is not None:
+            self._proc_thread.join(timeout=1.5)
+            self._proc_thread = None
         if self.cam_reader is not None:
             self.cam_reader.stop()
             self.cam_reader.join(timeout=1.5)
             self.cam_reader = None
 
     def open_camera(self, index):
-        self.frame_timer.stop()
         if self.is_recording:
             self.stop_recording()
-        self._stop_camera_reader()
+        self._stop_pipeline()
 
         self.camera_index = index
         self.prev_temporal_frame = None
-        self.last_frame_id = -1
         self.ui_fps_times.clear()
         self.live_buffer.clear()
 
@@ -2357,7 +2504,7 @@ class ProCameraWindow(QMainWindow):
 
         reader = CameraReader(index, w, h, target_fps=self.target_fps, backend_name=self.backend_name)
         reader.start()
-        reader._init_done.wait(timeout=4.0)
+        reader._init_done.wait(timeout=4.5)
 
         if not reader.ready:
             reader.stop()
@@ -2370,11 +2517,116 @@ class ProCameraWindow(QMainWindow):
             self.cam_reader.set_fast_shutter_lock(True)
 
         if reader.actual_w < w or reader.actual_h < h:
-            res_msg = f"Sensor {reader.actual_w}x{reader.actual_h} → HQ Output {w}x{h}"
+            res_msg = f"Sensor {reader.actual_w}x{reader.actual_h} → HQ {w}x{h}"
         else:
             res_msg = f"Native {reader.actual_w}x{reader.actual_h}"
-        self.set_status(f"Cam {index} ({reader.active_backend} | {res_msg} | Target {self.target_fps}fps)")
-        self.frame_timer.start(11)  # ~90Hz poll for silky 60fps capture
+        self.set_status(f"Cam {index} ({reader.active_backend} | {res_msg})")
+
+        # Start dedicated background processing thread so UI thread is 0% loaded
+        self._proc_running = True
+        self._proc_paused = False
+        self._proc_thread = threading.Thread(target=self._processing_loop, daemon=True)
+        self._proc_thread.start()
+        self.paint_timer.start(12)
+
+    def _build_hud_text(self, cfg, active_lut):
+        ev_txt = "AUTO" if cfg["auto_exposure"] else f"{cfg['ev_offset']:+.1f}EV"
+        iso = "ISO AUTO" if cfg["auto_iso"] else f"ISO {cfg['iso_val']}"
+        wb = "AWB" if cfg["auto_wb"] else f"{cfg['wb_kelvin']}K"
+        hdr = "HDR" if cfg["hdr_enabled"] else "STD"
+        res_lbl = self.res_options[self.combo_res.currentIndex()][0].split()[0]
+        return f" CAM {self.cam_fps:.0f} | UI {self.ui_fps:.0f} FPS | {res_lbl} | {self.mode} | EV {ev_txt} | {iso} | WB {wb} | {hdr}"
+
+    def _processing_loop(self):
+        last_fid = -1
+        while self._proc_running:
+            if self._proc_paused or self.cam_reader is None:
+                time.sleep(0.03)
+                continue
+
+            fid, frame_ts, raw, cam_fps = self.cam_reader.get_latest()
+            if raw is None or fid == last_fid:
+                time.sleep(0.002)
+                continue
+            last_fid = fid
+            self.cam_fps = cam_fps
+
+            now = time.perf_counter()
+            cfg = dict(self.settings)
+            lut = self.active_lut
+
+            clean_frame, self.prev_temporal_frame = apply_image_pipeline(
+                raw, cfg, lut, self.prev_temporal_frame
+            )
+            self.last_clean_frame = clean_frame
+
+            # Live Photo buffer + Async Recording (all off UI thread!)
+            rec_text = ""
+            live_active_now = False
+            with self.capture_lock:
+                if self.mode in ("PHOTO", "PRO") and self.live_photo_enabled:
+                    self.live_buffer.append((now, clean_frame))
+
+                if self.live_post_capturing:
+                    live_active_now = True
+                    self.live_post_frames.append((now, clean_frame))
+                    if now >= self.live_end_time:
+                        self.live_post_capturing = False
+                        combined = self.live_pre_frames + self.live_post_frames
+                        audio_np = self.audio_engine.finish_live_capture() if self.mic_enabled else None
+                        args = (
+                            combined, audio_np, self.live_still_frame,
+                            self.live_shutter_ts, self.live_base_path,
+                            self.mvimg_single_file, self.current_res, self.target_fps
+                        )
+                        threading.Thread(target=self._encode_live_av, args=args, daemon=True).start()
+
+                if self.is_recording and self.async_recorder is not None:
+                    elapsed = int(now - self.rec_start_time)
+                    mm, ss = divmod(elapsed, 60)
+                    if self.mode == "VIDEO":
+                        if self.async_recorder.push_frame(clean_frame):
+                            self.rec_frame_count += 1
+                        res_tag = self.res_options[self.combo_res.currentIndex()][0].split()[0]
+                        rec_text = f"REC {res_tag} {mm:02d}:{ss:02d} ({self.cam_fps:.0f}fps)"
+                    elif self.mode == "TIMELAPSE":
+                        if now - self.timelapse_last_grab >= self.timelapse_interval:
+                            if self.async_recorder.push_frame(clean_frame):
+                                self.rec_frame_count += 1
+                            self.timelapse_last_grab = now
+                        vid_sec = self.rec_frame_count / max(1.0, self.timelapse_fps)
+                        rec_text = f"TL {mm:02d}:{ss:02d} | {self.rec_frame_count}f ({vid_sec:.1f}s)"
+
+            if self.flash_alpha > 0.0:
+                self.flash_alpha = max(0.0, self.flash_alpha - 0.18)
+
+            vw = max(480, self.preview_view.width())
+            vh = max(300, self.preview_view.height())
+            rgb_vis = make_preview_rgb(
+                clean_frame, vw, vh, cfg,
+                self.countdown_val, self.flash_alpha,
+                live_active_now, rec_text, self._build_hud_text(cfg, lut)
+            )
+
+            with self._render_lock:
+                self._ready_rgb = rgb_vis
+                self._ready_id += 1
+
+    def _present_frame(self):
+        with self._render_lock:
+            if self._ready_id == self._shown_id or self._ready_rgb is None:
+                return
+            rgb = self._ready_rgb
+            self._shown_id = self._ready_id
+
+        now = time.perf_counter()
+        self.ui_fps_times.append(now)
+        if len(self.ui_fps_times) >= 2:
+            span = self.ui_fps_times[-1] - self.ui_fps_times[0]
+            if span > 0.05:
+                self.ui_fps = (len(self.ui_fps_times) - 1) / span
+
+        self.preview_view.set_rgb_buffer(rgb)
 
     def change_backend(self, name):
         self.backend_name = name
@@ -2401,7 +2653,8 @@ class ProCameraWindow(QMainWindow):
         self.live_photo_enabled = checked
         self.btn_live.setText("◉ LIVE" if checked else "○ LIVE")
         if not checked:
-            self.live_buffer.clear()
+            with self.capture_lock:
+                self.live_buffer.clear()
 
     def toggle_mvimg_format(self, checked):
         self.mvimg_single_file = checked
@@ -2459,90 +2712,6 @@ class ProCameraWindow(QMainWindow):
         self.status_label.setText(text)
 
     # ==========================================
-    # Main Render Loop
-    # ==========================================
-    def _build_hud_text(self):
-        ev_txt = "AUTO" if self.settings["auto_exposure"] else f"{self.settings['ev_offset']:+.1f}EV"
-        iso = "ISO AUTO" if self.settings["auto_iso"] else f"ISO {self.settings['iso_val']}"
-        wb = "AWB" if self.settings["auto_wb"] else f"{self.settings['wb_kelvin']}K"
-        hdr = "HDR" if self.settings["hdr_enabled"] else "STD"
-        res_lbl = self.combo_res.currentText().split()[0]
-        fps_str = f"CAM {self.cam_fps:.0f} | UI {self.ui_fps:.0f} FPS"
-        return f" {fps_str} | {res_lbl} | {self.mode} | EV {ev_txt} | {iso} | WB {wb} | {hdr}"
-
-    def update_frame(self):
-        if self.cam_reader is None:
-            return
-        fid, frame_ts, raw, cam_fps = self.cam_reader.get_latest()
-        if raw is None or fid == self.last_frame_id:
-            return
-        self.last_frame_id = fid
-        self.cam_fps = cam_fps
-
-        now = time.perf_counter()
-        self.ui_fps_times.append(now)
-        if len(self.ui_fps_times) >= 2:
-            span = self.ui_fps_times[-1] - self.ui_fps_times[0]
-            if span > 0.05:
-                self.ui_fps = (len(self.ui_fps_times) - 1) / span
-
-        clean_frame, self.prev_temporal_frame = apply_image_pipeline(
-            raw, self.settings, self.active_lut, self.prev_temporal_frame
-        )
-        self.last_clean_frame = clean_frame
-
-        if self.mode in ("PHOTO", "PRO") and self.live_photo_enabled:
-            self.live_buffer.append((now, clean_frame))
-
-        if self.live_post_capturing:
-            self.live_post_frames.append((now, clean_frame))
-            if now >= self.live_end_time:
-                self.live_post_capturing = False
-                combined_frames = self.live_pre_frames + self.live_post_frames
-                audio_np = self.audio_engine.finish_live_capture() if self.mic_enabled else None
-                threading.Thread(
-                    target=self._encode_live_av,
-                    args=(
-                        combined_frames,
-                        audio_np,
-                        self.live_still_frame,
-                        self.live_shutter_ts,
-                        self.live_base_path,
-                        self.mvimg_single_file,
-                        self.current_res,
-                        self.target_fps
-                    ),
-                    daemon=True
-                ).start()
-
-        rec_text = ""
-        if self.is_recording and self.async_recorder is not None:
-            elapsed = int(now - self.rec_start_time)
-            mm, ss = divmod(elapsed, 60)
-            if self.mode == "VIDEO":
-                if self.async_recorder.push_frame(clean_frame):
-                    self.rec_frame_count += 1
-                res_tag = self.combo_res.currentText().split()[0]
-                rec_text = f"REC {res_tag} {mm:02d}:{ss:02d} ({self.ui_fps:.0f}fps)"
-            elif self.mode == "TIMELAPSE":
-                if now - self.timelapse_last_grab >= self.timelapse_interval:
-                    if self.async_recorder.push_frame(clean_frame):
-                        self.rec_frame_count += 1
-                    self.timelapse_last_grab = now
-                vid_sec = self.rec_frame_count / max(1.0, self.timelapse_fps)
-                rec_text = f"TL {mm:02d}:{ss:02d} | {self.rec_frame_count}f ({vid_sec:.1f}s)"
-
-        if self.flash_alpha > 0.0:
-            self.flash_alpha = max(0.0, self.flash_alpha - 0.18)
-
-        vis = make_preview_frame(
-            clean_frame, self.preview_view.width(), self.preview_view.height(),
-            self.settings, self.countdown_val, self.flash_alpha,
-            self.live_post_capturing, rec_text, self._build_hud_text()
-        )
-        self.preview_view.set_bgr_frame(vis)
-
-    # ==========================================
     # Capture Actions
     # ==========================================
     def trigger_shutter(self):
@@ -2593,36 +2762,37 @@ class ProCameraWindow(QMainWindow):
         self.flash_alpha = 0.75
 
         if is_live:
-            if not self.live_post_capturing:
-                now = time.perf_counter()
-                prefix = "MVIMG_" if self.mvimg_single_file else "LIVE_"
-                self.live_base_path = os.path.join(DIRS["live"], f"{prefix}{ts}")
-                self.live_still_frame = frame
-                self.live_shutter_ts = now
+            with self.capture_lock:
+                if not self.live_post_capturing:
+                    now = time.perf_counter()
+                    prefix = "MVIMG_" if self.mvimg_single_file else "LIVE_"
+                    self.live_base_path = os.path.join(DIRS["live"], f"{prefix}{ts}")
+                    self.live_still_frame = frame
+                    self.live_shutter_ts = now
 
-                if not self.mvimg_single_file:
-                    threading.Thread(
-                        target=self._save_polished_still,
-                        args=(frame, self.live_base_path + ".jpg", False, target_res),
-                        daemon=True
-                    ).start()
+                    if not self.mvimg_single_file:
+                        threading.Thread(
+                            target=self._save_polished_still,
+                            args=(frame, self.live_base_path + ".jpg", False, target_res),
+                            daemon=True
+                        ).start()
 
-                if self.mode == "PRO" and self.settings["save_png"]:
-                    threading.Thread(
-                        target=self._save_polished_still,
-                        args=(frame, os.path.join(DIRS["photos"], f"PRO_{ts}.png"), True, target_res),
-                        daemon=True
-                    ).start()
+                    if self.mode == "PRO" and self.settings["save_png"]:
+                        threading.Thread(
+                            target=self._save_polished_still,
+                            args=(frame, os.path.join(DIRS["photos"], f"PRO_{ts}.png"), True, target_res),
+                            daemon=True
+                        ).start()
 
-                self.live_pre_frames = [
-                    (t, f) for (t, f) in list(self.live_buffer) if t >= now - 1.5
-                ]
-                self.live_post_frames = [(now, frame)]
-                self.live_end_time = now + 1.5
-                if self.mic_enabled:
-                    self.audio_engine.begin_live_capture(pre_seconds=1.5)
-                self.live_post_capturing = True
-                self.set_status("Capturing MVIMG Motion Photo + Audio (1.5s)...")
+                    self.live_pre_frames = [
+                        (t, f) for (t, f) in list(self.live_buffer) if t >= now - 1.5
+                    ]
+                    self.live_post_frames = [(now, frame)]
+                    self.live_end_time = now + 1.5
+                    if self.mic_enabled:
+                        self.audio_engine.begin_live_capture(pre_seconds=1.5)
+                    self.live_post_capturing = True
+                    self.set_status("Capturing Smooth 60fps MVIMG + Audio (1.5s)...")
         else:
             is_png = (self.mode == "PRO" and self.settings["save_png"])
             out_path = os.path.join(
@@ -2656,7 +2826,7 @@ class ProCameraWindow(QMainWindow):
             self.audio_engine.save_wav(audio_np, temp_wav)
 
         muxed_mp4 = tempfile.mktemp(suffix="_live_mux.mp4") if as_mvimg else (base_path + ".mp4")
-        ok = encode_cfr_live_mp4(frames_with_ts, temp_wav, muxed_mp4, target_fps=target_fps)
+        ok = encode_smooth_cfr_live_mp4(frames_with_ts, temp_wav, muxed_mp4, target_fps=target_fps)
         tag = "Audio" if audio_np is not None and len(audio_np) > 0 else "Silent"
 
         if not ok:
@@ -2669,7 +2839,7 @@ class ProCameraWindow(QMainWindow):
                 final_still = self._polish_and_scale_still(still_frame, target_res)
                 pack_android_motion_photo(final_still, muxed_mp4, final_mvimg, keyframe_us=keyframe_us)
                 self.status_signal.emit(
-                    f"Saved MVIMG ({final_still.shape[1]}x{final_still.shape[0]} | {tag}): {os.path.basename(final_mvimg)}"
+                    f"Saved Smooth MVIMG ({final_still.shape[1]}x{final_still.shape[0]} | {tag}): {os.path.basename(final_mvimg)}"
                 )
             except Exception as e:
                 self.status_signal.emit(f"MVIMG Error: {e}")
@@ -2697,29 +2867,32 @@ class ProCameraWindow(QMainWindow):
         out_w, out_h = self.current_res
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        self.rec_frame_count = 0
-        self.rec_start_time = time.perf_counter()
+        with self.capture_lock:
+            self.rec_frame_count = 0
+            self.rec_start_time = time.perf_counter()
 
-        if self.mode == "VIDEO":
-            self.active_video_path = os.path.join(DIRS["videos"], f"VID_{ts}.mp4")
-            self.async_recorder = AsyncVideoRecorder(in_w, in_h, out_w, out_h, target_fps=self.target_fps)
-            if self.mic_enabled:
-                self.audio_engine.start_video_recording()
-        else:
-            self.active_video_path = os.path.join(DIRS["timelapse"], f"TL_{ts}.mp4")
-            self.async_recorder = AsyncVideoRecorder(in_w, in_h, out_w, out_h, target_fps=self.timelapse_fps)
-            self.timelapse_last_grab = 0.0
+            if self.mode == "VIDEO":
+                self.active_video_path = os.path.join(DIRS["videos"], f"VID_{ts}.mp4")
+                self.async_recorder = AsyncVideoRecorder(in_w, in_h, out_w, out_h, target_fps=self.target_fps)
+                if self.mic_enabled:
+                    self.audio_engine.start_video_recording()
+            else:
+                self.active_video_path = os.path.join(DIRS["timelapse"], f"TL_{ts}.mp4")
+                self.async_recorder = AsyncVideoRecorder(in_w, in_h, out_w, out_h, target_fps=self.timelapse_fps)
+                self.timelapse_last_grab = 0.0
 
-        self.is_recording = True
+            self.is_recording = True
+
         self.btn_shutter.setText("■")
         self.set_status(f"Recording {self.mode} ({out_w}x{out_h} Async)...")
 
     def stop_recording(self):
-        self.is_recording = False
-        self.btn_shutter.setText("●")
+        with self.capture_lock:
+            self.is_recording = False
+            recorder = self.async_recorder
+            self.async_recorder = None
 
-        recorder = self.async_recorder
-        self.async_recorder = None
+        self.btn_shutter.setText("●")
         if recorder is None:
             return
 
@@ -2760,8 +2933,20 @@ class ProCameraWindow(QMainWindow):
         self.status_signal.emit(f"Saved {mode_now} ({recorder.out_w}x{recorder.out_h}): {os.path.basename(final_mp4)}")
 
     def open_gallery(self):
-        dlg = GalleryDialog(self)
-        dlg.exec()
+        # Pause main camera pipeline while Gallery is open for 100% smooth playback
+        self._proc_paused = True
+        self.paint_timer.stop()
+        if self.cam_reader is not None:
+            self.cam_reader.set_paused(True)
+
+        try:
+            dlg = GalleryDialog(self)
+            dlg.exec()
+        finally:
+            if self.cam_reader is not None:
+                self.cam_reader.set_paused(False)
+            self._proc_paused = False
+            self.paint_timer.start(12)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -2789,11 +2974,10 @@ class ProCameraWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
-        self.frame_timer.stop()
         if self.is_recording:
             self.stop_recording()
         self.audio_engine.stop()
-        self._stop_camera_reader()
+        self._stop_pipeline()
         super().closeEvent(event)
 
 
@@ -2826,7 +3010,7 @@ class AnimatedSplashScreen(QWidget):
         self.progress = 0.0
         self.opacity_val = 0.0
         self.fading_out = False
-        self.status_text = "Initializing 4K 60fps Engine..."
+        self.status_text = "Initializing Smooth 60fps Engine..."
         self.main_win = None
 
         screen = QApplication.primaryScreen().availableGeometry()
@@ -2863,9 +3047,9 @@ class AnimatedSplashScreen(QWidget):
         self.progress = 1.0 - (1.0 - raw_p) ** 2
 
         if self.progress < 0.30:
-            self.status_text = "Initializing 4K 60fps Engine..."
+            self.status_text = "Initializing Smooth 60fps Engine..."
         elif self.progress < 0.65:
-            self.status_text = "Loading Real-Time MVIMG & Audio..."
+            self.status_text = "Loading RAM-Cached MVIMG & Audio..."
         elif self.progress < 0.90:
             self.status_text = "Preparing Pro Controls & 3D LUT..."
         else:
@@ -2956,7 +3140,7 @@ class AnimatedSplashScreen(QWidget):
 if __name__ == "__main__":
     if os.name == "nt":
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.6")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.7")
 
     app = QApplication(sys.argv)
     icon_file = resource_path("app_icon.ico")
