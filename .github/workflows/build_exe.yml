@@ -18,9 +18,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install PyQt6 opencv-python numpy Pillow sounddevice imageio-ffmpeg pyinstaller
 
-      - name: Build EXE
+      - name: Generate ICO & Build EXE
+        shell: pwsh
         run: |
-          pyinstaller --noconsole --onefile --clean --collect-all imageio_ffmpeg --collect-all _sounddevice_data --name "ProCam_Windows" ProCameraWindows.py
+          $logo = if (Test-Path "logo.jpg") { "logo.jpg" } elseif (Test-Path "logo.png") { "logo.png" } else { "" }
+          if ($logo -ne "") {
+            python -c "from PIL import Image; img=Image.open('$logo').convert('RGBA'); w,h=img.size; s=int(min(w,h)*0.86); img.crop(((w-s)//2,(h-s)//2,(w+s)//2,(h+s)//2)).save('app_icon.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
+            pyinstaller --noconsole --onefile --clean --icon="app_icon.ico" --add-data "app_icon.ico;." --add-data "$logo;." --collect-all imageio_ffmpeg --collect-all _sounddevice_data --name "ProCam_Windows" ProCameraWindows.py
+          } else {
+            pyinstaller --noconsole --onefile --clean --collect-all imageio_ffmpeg --collect-all _sounddevice_data --name "ProCam_Windows" ProCameraWindows.py
+          }
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
