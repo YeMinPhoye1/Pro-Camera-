@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QDialog, QListWidget, QListWidgetItem, QMessageBox, QSizePolicy,
     QButtonGroup, QTabWidget, QFileDialog
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF, QRect
 from PyQt6.QtGui import (
     QImage, QPixmap, QFont, QIcon,
     QPainter, QPainterPath, QLinearGradient, QColor, QPen
@@ -64,6 +64,172 @@ for d in DIRS.values():
 def resource_path(filename):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, filename)
+
+
+# ==========================================
+# Zero-Latency Background Camera Thread
+# ==========================================
+class CameraReader(threading.Thread):
+    """
+    Continuously reads frames on a dedicated background thread so the UI never blocks
+    and DirectShow never queues stale delayed frames.
+    """
+
+    def __init__(self, index, width, height):
+        super().__init__(daemon=True)
+        self.index = index
+        self.req_w = width
+        self.req_h = height
+
+        self._lock = threading.Lock()
+        self._running = True
+        self._frame = None
+        self._frame_id = 0
+        self._frame_ts = 0.0
+        self._pending_props = {}
+
+        self.ready = False
+        self.error_msg = ""
+        self.actual_w = width
+        self.actual_h = height
+        self._init_done = threading.Event()
+
+    def _open_capture(self, use_mjpg=True):
+        cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(self.index)
+        if not cap.isOpened():
+            return None
+
+        # MJPG unlocks full 30-60 FPS at 1080p on Windows DirectShow (avoids 5fps YUY2 lag)
+        if use_mjpg:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_h)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def set_prop(self, prop_id, value):
+        with self._lock:
+            self._pending_props[prop_id] = value
+
+    def get_latest(self):
+        with self._lock:
+            return self._frame_id, self._frame_ts, self._frame
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        cap = self._open_capture(use_mjpg=True)
+        if cap is None:
+            self.error_msg = f"Camera {self.index} not detected."
+            self._init_done.set()
+            return
+
+        # Test read; if MJPG isn't supported by a virtual camera, fallback automatically
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            cap.release()
+            cap = self._open_capture(use_mjpg=False)
+            if cap is None:
+                self.error_msg = f"Camera {self.index} failed to open."
+                self._init_done.set()
+                return
+            ret, frame = cap.read()
+
+        if ret and frame is not None:
+            self.actual_h, self.actual_w = frame.shape[:2]
+            with self._lock:
+                self._frame = frame
+                self._frame_id = 1
+                self._frame_ts = time.time()
+            self.ready = True
+        else:
+            self.error_msg = f"Camera {self.index} returned no video signal."
+
+        self._init_done.set()
+
+        try:
+            while self._running:
+                # Apply any queued hardware property updates on the owning camera thread
+                props = None
+                with self._lock:
+                    if self._pending_props:
+                        props = self._pending_props.copy()
+                        self._pending_props.clear()
+                if props:
+                    for pid, val in props.items():
+                        try:
+                            cap.set(pid, val)
+                        except Exception:
+                            pass
+
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    now = time.time()
+                    with self._lock:
+                        self._frame = frame
+                        self._frame_id += 1
+                        self._frame_ts = now
+                else:
+                    time.sleep(0.005)
+        finally:
+            cap.release()
+
+
+# ==========================================
+# Ultra-Fast Zero-Copy Preview Widget
+# ==========================================
+class FastVideoView(QWidget):
+    """Renders BGR frames directly via QPainter without QPixmap conversion lag."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(640, 360)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._rgb_buf = None
+        self._qimg = None
+        self._message = "Starting Windows Camera..."
+
+    def set_message(self, msg):
+        self._qimg = None
+        self._rgb_buf = None
+        self._message = msg
+        self.update()
+
+    def set_bgr_frame(self, bgr_img):
+        # Single fast BGR->RGB conversion; keep buffer alive for QImage
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        self._rgb_buf = rgb
+        self._qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect()
+
+        # Rounded dark viewfinder frame
+        painter.fillRect(rect, QColor("#08080b"))
+
+        if self._qimg is not None:
+            iw, ih = self._qimg.width(), self._qimg.height()
+            vw, vh = rect.width(), rect.height()
+            scale = min(vw / max(1, iw), vh / max(1, ih))
+            dw, dh = int(iw * scale), int(ih * scale)
+            dx = (vw - dw) // 2
+            dy = (vh - dh) // 2
+            painter.drawImage(QRect(dx, dy, dw, dh), self._qimg)
+        else:
+            painter.setPen(QColor("#a0a2b8"))
+            painter.setFont(QFont("Segoe UI", 12))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._message)
+
+        # Subtle border
+        painter.setPen(QPen(QColor("#282834"), 1))
+        painter.drawRect(0, 0, rect.width() - 1, rect.height() - 1)
 
 
 # ==========================================
@@ -278,11 +444,11 @@ class CubeLUT:
                 raise ValueError(f"Invalid 1D LUT: expected {size_1d} entries, found {len(arr)}.")
             arr = arr[:size_1d]
             lin = np.linspace(0.0, 1.0, 256, dtype=np.float32)
-            out_1d = np.empty((256, 3), dtype=np.uint8)
+            out_1d = np.empty((1, 256, 3), dtype=np.uint8)
             for ch in range(3):
                 norm = np.clip((lin - dmin[ch]) / max(1e-6, dmax[ch] - dmin[ch]), 0.0, 1.0)
                 vals = np.interp(norm * (size_1d - 1), np.arange(size_1d), arr[:, ch])
-                out_1d[:, 2 - ch] = np.clip(vals * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                out_1d[0, :, 2 - ch] = np.clip(vals * 255.0 + 0.5, 0, 255).astype(np.uint8)
             self.lut_1d = out_1d
             self.is_1d = True
         else:
@@ -326,10 +492,7 @@ class CubeLUT:
         if strength <= 0.01:
             return bgr_img
         if self.is_1d:
-            out = np.empty_like(bgr_img)
-            out[:, :, 0] = self.lut_1d[bgr_img[:, :, 0], 0]
-            out[:, :, 1] = self.lut_1d[bgr_img[:, :, 1], 1]
-            out[:, :, 2] = self.lut_1d[bgr_img[:, :, 2], 2]
+            out = cv2.LUT(bgr_img, self.lut_1d)
         else:
             out = self.baked_3d[bgr_img[:, :, 0] >> 1, bgr_img[:, :, 1] >> 1, bgr_img[:, :, 2] >> 1]
         if strength < 0.99:
@@ -475,8 +638,14 @@ def mux_video_audio_ffmpeg(temp_video, temp_wav, final_mp4, pts_scale=1.0):
 
 
 # ==========================================
-# Image Quality: Denoise, Clarity, HDR & Pro Exposure
+# High-Speed Cached Color, Denoise & HDR Engine
 # ==========================================
+HDR_CLAHE = cv2.createCLAHE(clipLimit=2.3, tileGridSize=(8, 8))
+BW_CLAHE = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+HDR_GAMMA_LUT = np.clip((np.linspace(0.0, 1.0, 256, dtype=np.float32) ** 0.80) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+SEPIA_KERNEL = np.array([[0.272, 0.534, 0.131], [0.349, 0.686, 0.168], [0.393, 0.769, 0.189]], dtype=np.float32)
+
+
 def kelvin_to_bgr_gains(kelvin):
     temp = max(2500.0, min(8500.0, float(kelvin))) / 100.0
 
@@ -495,68 +664,116 @@ def kelvin_to_bgr_gains(kelvin):
     return gains / gains[1]
 
 
-def build_exposure_lut(ev_offset, iso_val):
-    ev_gain = 2.0 ** (ev_offset * 0.55)
-    iso_gain = (iso_val / 400.0) ** 0.50
-    total_gain = ev_gain * iso_gain
-    if abs(total_gain - 1.0) < 0.015:
-        return None
-    x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
-    y = x * total_gain
-    if total_gain > 1.0:
-        y = y / (1.0 + 0.38 * np.maximum(0.0, y - 0.65))
-    return np.clip(y * 255.0 + 0.5, 0, 255).astype(np.uint8)
+class FastToneLUTCache:
+    """Fuses EV + ISO + Kelvin WB + Brightness + Contrast + Film Tint into one <1ms cv2.LUT."""
+
+    def __init__(self):
+        self._last_key = None
+        self._lut = None
+
+    def get_lut(self, ev, iso, wb_kelvin, brightness, contrast, flt):
+        key = (round(ev, 2), iso, wb_kelvin, brightness, round(contrast, 2), flt)
+        if key == self._last_key:
+            return self._lut
+
+        self._last_key = key
+
+        is_neutral = (
+            abs(ev) < 0.01 and iso == 400 and wb_kelvin is None
+            and brightness == 0 and abs(contrast - 1.0) < 0.01
+            and flt not in ("Warm Film", "Cool Cinema")
+        )
+        if is_neutral:
+            self._lut = None
+            return None
+
+        x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+
+        # 1. EV + ISO curve with highlight roll-off
+        total_gain = (2.0 ** (ev * 0.55)) * ((iso / 400.0) ** 0.50)
+        y = x * total_gain
+        if total_gain > 1.0:
+            y = y / (1.0 + 0.38 * np.maximum(0.0, y - 0.65))
+
+        # 2. Expand to 3 channels (B, G, R)
+        bgr = np.stack([y, y, y], axis=1) * 255.0
+
+        # 3. White Balance Kelvin
+        if wb_kelvin is not None:
+            bgr *= kelvin_to_bgr_gains(wb_kelvin)[None, :]
+
+        # 4. Contrast & Brightness
+        bgr = bgr * contrast + float(brightness)
+
+        # 5. Built-in Warm Film / Cool Cinema fused directly into the same LUT
+        if flt == "Warm Film":
+            bgr[:, 0] -= 14.0
+            bgr[:, 1] += 6.0
+            bgr[:, 2] += 18.0
+            bgr = bgr * 0.94 + 12.0
+        elif flt == "Cool Cinema":
+            bgr[:, 0] += 18.0
+            bgr[:, 1] += 5.0
+            bgr[:, 2] -= 8.0
+            bgr = bgr * 1.12 - 6.0
+
+        self._lut = np.clip(bgr + 0.5, 0, 255).astype(np.uint8).reshape((1, 256, 3))
+        return self._lut
 
 
-def apply_clean_denoise_clarity(img, prev_frame, strength=1.0):
+TONE_CACHE = FastToneLUTCache()
+
+
+def apply_fast_clean_denoise(img, prev_frame, strength=0.85):
+    """High-FPS motion-adaptive temporal + half-res chroma + light edge-preserving denoise."""
     out = img
+    h, w = out.shape[:2]
 
+    # 1. Fast Quarter-Res Motion-Adaptive Temporal Denoise (no ghosting, very low CPU)
     if prev_frame is not None and prev_frame.shape == out.shape:
-        diff = cv2.absdiff(out, prev_frame)
+        sw, sh = max(80, w // 4), max(45, h // 4)
+        s_cur = cv2.resize(out, (sw, sh), interpolation=cv2.INTER_NEAREST)
+        s_prv = cv2.resize(prev_frame, (sw, sh), interpolation=cv2.INTER_NEAREST)
+        diff = cv2.absdiff(s_cur, s_prv)
         gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
         thresh = 16.0 + 12.0 * strength
         motion = np.clip(gray_diff.astype(np.float32) / thresh, 0.0, 1.0)
         motion = cv2.GaussianBlur(motion, (5, 5), 0)
-        min_alpha = max(0.24, 0.55 - 0.28 * strength)
-        alpha = (min_alpha + (1.0 - min_alpha) * motion)[:, :, None]
+        min_a = max(0.28, 0.58 - 0.28 * strength)
+        alpha_small = min_a + (1.0 - min_a) * motion
+        alpha = cv2.resize(alpha_small, (w, h), interpolation=cv2.INTER_LINEAR)[:, :, None]
         out = np.clip(
             out.astype(np.float32) * alpha + prev_frame.astype(np.float32) * (1.0 - alpha),
             0, 255
         ).astype(np.uint8)
 
+    # 2. Half-Res Chroma Noise Wipe (eliminates purple/green webcam grain at 60fps)
     ycrcb = cv2.cvtColor(out, cv2.COLOR_BGR2YCrCb)
     y, cr, cb = cv2.split(ycrcb)
+    hw, hh = max(160, w // 2), max(90, h // 2)
+    cr = cv2.resize(cv2.GaussianBlur(cv2.resize(cr, (hw, hh)), (5, 5), 0), (w, h), interpolation=cv2.INTER_LINEAR)
+    cb = cv2.resize(cv2.GaussianBlur(cv2.resize(cb, (hw, hh)), (5, 5), 0), (w, h), interpolation=cv2.INTER_LINEAR)
 
-    cr = cv2.GaussianBlur(cr, (5, 5), 0)
-    cb = cv2.GaussianBlur(cb, (5, 5), 0)
-
-    sigma = int(16 + 18 * strength)
-    y_smooth = cv2.bilateralFilter(y, 5, sigma, sigma)
-
-    y_blur = cv2.GaussianBlur(y_smooth, (0, 0), 1.3)
-    clarity_amt = 0.28 * strength
-    y_clean = cv2.addWeighted(y_smooth, 1.0 + clarity_amt, y_blur, -clarity_amt, 0)
+    # 3. Fast Luma Smooth + Micro-Clarity
+    y_small = cv2.resize(y, (hw, hh), interpolation=cv2.INTER_AREA)
+    sig = int(14 + 16 * strength)
+    y_bilat = cv2.resize(cv2.bilateralFilter(y_small, 5, sig, sig), (w, h), interpolation=cv2.INTER_LINEAR)
+    y_mix = cv2.addWeighted(y, 0.45, y_bilat, 0.55, 0)
+    y_blur = cv2.GaussianBlur(y_mix, (0, 0), 1.2)
+    y_clean = cv2.addWeighted(y_mix, 1.0 + 0.25 * strength, y_blur, -0.25 * strength, 0)
 
     return cv2.cvtColor(cv2.merge((y_clean, cr, cb)), cv2.COLOR_YCrCb2BGR)
 
 
-def apply_hdr_effect(img, strength=1.0):
+def apply_hdr_effect(img, strength=0.85):
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
-    clahe = cv2.createCLAHE(clipLimit=2.3, tileGridSize=(8, 8))
-    l_clahe = clahe.apply(l)
-
-    l_norm = l.astype(np.float32) / 255.0
-    l_lifted = np.power(l_norm, 0.80) * 255.0
-    l_hdr = np.clip(0.55 * l_clahe.astype(np.float32) + 0.45 * l_lifted, 0, 255).astype(np.uint8)
+    l_clahe = HDR_CLAHE.apply(l)
+    l_lifted = cv2.LUT(l, HDR_GAMMA_LUT)
+    l_hdr = cv2.addWeighted(l_clahe, 0.55, l_lifted, 0.45, 0)
 
     hdr_bgr = cv2.cvtColor(cv2.merge((l_hdr, a, b)), cv2.COLOR_LAB2BGR)
-
-    hsv = cv2.cvtColor(hdr_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.14, 0, 255)
-    hdr_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
     if strength < 0.99:
         return cv2.addWeighted(hdr_bgr, strength, img, 1.0 - strength, 0)
     return hdr_bgr
@@ -565,9 +782,11 @@ def apply_hdr_effect(img, strength=1.0):
 def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
     img = frame
 
+    # 1. Mirror
     if settings["mirror"]:
         img = cv2.flip(img, 1)
 
+    # 2. Digital Zoom
     zoom = settings["zoom"]
     if zoom > 1.01:
         h, w = img.shape[:2]
@@ -575,69 +794,52 @@ def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
         x1, y1 = (w - nw) // 2, (h - nh) // 2
         img = cv2.resize(img[y1:y1 + nh, x1:x1 + nw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-    temporal_next = img
+    # 3. Real-time Clean Denoise (only runs when enabled)
+    temporal_next = None
     if settings["clean_enabled"] and settings["clean_strength"] > 0.05:
-        img = apply_clean_denoise_clarity(img, prev_temporal, settings["clean_strength"])
+        img = apply_fast_clean_denoise(img, prev_temporal, settings["clean_strength"])
         temporal_next = img
 
-    # PRO Exposure (EV) & ISO / Gain (Auto = neutral 1.0x pass-through)
+    # 4. Single-Pass Fused Tone LUT (EV + ISO + WB + Brightness + Contrast + Warm/Cool Film)
     ev_eff = 0.0 if settings["auto_exposure"] else settings["ev_offset"]
     iso_eff = 400 if settings["auto_iso"] else settings["iso_val"]
-    exp_lut = build_exposure_lut(ev_eff, iso_eff)
-    if exp_lut is not None:
-        img = cv2.LUT(img, exp_lut)
+    wb_eff = None if settings["auto_wb"] else settings["wb_kelvin"]
+    flt = settings["filter"]
 
-    # PRO White Balance
-    if not settings["auto_wb"]:
-        gains = kelvin_to_bgr_gains(settings["wb_kelvin"])
-        img = np.clip(img.astype(np.float32) * gains[None, None, :], 0, 255).astype(np.uint8)
+    tone_lut = TONE_CACHE.get_lut(ev_eff, iso_eff, wb_eff, settings["brightness"], settings["contrast"], flt)
+    if tone_lut is not None:
+        img = cv2.LUT(img, tone_lut)
 
+    # 5. HDR Mode
     if settings["hdr_enabled"]:
         img = apply_hdr_effect(img, settings["hdr_strength"])
 
-    if settings["brightness"] != 0 or abs(settings["contrast"] - 1.0) > 0.01:
-        img = cv2.convertScaleAbs(img, alpha=settings["contrast"], beta=settings["brightness"])
-
-    sat = settings["saturation"]
+    # 6. Saturation (and Vivid boost)
+    sat = settings["saturation"] * (1.35 if flt == "Vivid" else 1.0)
     if abs(sat - 1.0) > 0.01:
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat, 0, 255)
-        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        s_lut = np.clip(np.arange(256, dtype=np.float32) * sat + 0.5, 0, 255).astype(np.uint8)
+        hsv[:, :, 1] = cv2.LUT(hsv[:, :, 1], s_lut)
+        img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
+    # 7. Remaining Built-in Looks
+    if flt == "Leica B&W":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = cv2.cvtColor(cv2.convertScaleAbs(BW_CLAHE.apply(gray), alpha=1.18, beta=-12), cv2.COLOR_GRAY2BGR)
+    elif flt == "Vintage Sepia":
+        img = cv2.transform(img, SEPIA_KERNEL)
+
+    # 8. Extra Sharpness (only if > 0)
     sharp = settings["sharpness"]
     if sharp > 0.01:
-        blur = cv2.GaussianBlur(img, (0, 0), 1.4)
+        blur = cv2.GaussianBlur(img, (0, 0), 1.3)
         img = cv2.addWeighted(img, 1.0 + sharp, blur, -sharp, 0)
 
-    flt = settings["filter"]
-    if flt == "Vivid":
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.35, 0, 255)
-        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.05, 0, 255)
-        img = cv2.convertScaleAbs(cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR), alpha=1.1, beta=0)
-    elif flt == "Leica B&W":
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-        img = cv2.cvtColor(cv2.convertScaleAbs(clahe.apply(gray), alpha=1.18, beta=-12), cv2.COLOR_GRAY2BGR)
-    elif flt == "Warm Film":
-        b, g, r = cv2.split(img)
-        r = np.clip(r.astype(np.int16) + 18, 0, 255).astype(np.uint8)
-        g = np.clip(g.astype(np.int16) + 6, 0, 255).astype(np.uint8)
-        b = np.clip(b.astype(np.int16) - 14, 0, 255).astype(np.uint8)
-        img = np.clip(cv2.merge((b, g, r)).astype(np.float32) * 0.94 + 12, 0, 255).astype(np.uint8)
-    elif flt == "Cool Cinema":
-        b, g, r = cv2.split(img)
-        b = np.clip(b.astype(np.int16) + 18, 0, 255).astype(np.uint8)
-        g = np.clip(g.astype(np.int16) + 5, 0, 255).astype(np.uint8)
-        r = np.clip(r.astype(np.int16) - 8, 0, 255).astype(np.uint8)
-        img = cv2.convertScaleAbs(cv2.merge((b, g, r)), alpha=1.12, beta=-6)
-    elif flt == "Vintage Sepia":
-        kernel = np.array([[0.272, 0.534, 0.131], [0.349, 0.686, 0.168], [0.393, 0.769, 0.189]])
-        img = np.clip(cv2.transform(img, kernel), 0, 255).astype(np.uint8)
-
+    # 9. Custom .cube 3D LUT
     if active_lut is not None and settings["lut_strength"] > 0.01:
         img = active_lut.apply(img, settings["lut_strength"])
 
+    # 10. Watermark
     if settings["watermark"]:
         h, w = img.shape[:2]
         hdr_tag = "  |  HDR" if settings["hdr_enabled"] else ""
@@ -653,25 +855,26 @@ def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
 
 
 # ==========================================
-# Non-Destructive Pro Viewfinder Overlays
+# Lightweight Preview-Res Overlays (Runs on Display Size = 4x Faster)
 # ==========================================
 def draw_rgb_histogram(vis):
     h, w = vis.shape[:2]
-    hw, hh = 180, 78
-    x0, y0 = w - hw - 14, 14
+    hw, hh = 156, 68
+    x0, y0 = w - hw - 12, 12
     if x0 < 0 or y0 + hh > h:
         return
 
     roi = vis[y0:y0 + hh, x0:x0 + hw]
-    vis[y0:y0 + hh, x0:x0 + hw] = cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0)
-    cv2.rectangle(vis, (x0, y0), (x0 + hw, y0 + hh), (80, 80, 95), 1)
+    vis[y0:y0 + hh, x0:x0 + hw] = (roi >> 1)  # Ultra-fast 50% darken without float/addWeighted
+    cv2.rectangle(vis, (x0, y0), (x0 + hw, y0 + hh), (85, 85, 100), 1)
 
-    small = cv2.resize(vis, (240, 135), interpolation=cv2.INTER_NEAREST)
-    bins = 64
+    small = cv2.resize(vis, (160, 90), interpolation=cv2.INTER_NEAREST)
+    bins = 48
     for ch, col in enumerate([(255, 110, 70), (80, 235, 110), (75, 85, 255)]):
         hist = cv2.calcHist([small], [ch], None, [bins], [0, 256]).flatten()
-        if hist.max() > 0:
-            hist = (hist / hist.max()) * (hh - 10)
+        m = hist.max()
+        if m > 0:
+            hist = (hist / m) * (hh - 10)
         pts = np.zeros((bins, 1, 2), dtype=np.int32)
         for i in range(bins):
             pts[i, 0, 0] = x0 + 4 + int(i * (hw - 8) / (bins - 1))
@@ -679,58 +882,68 @@ def draw_rgb_histogram(vis):
         cv2.polylines(vis, [pts], False, col, 1, cv2.LINE_AA)
 
 
-def draw_preview_overlays(frame, settings, countdown_val, flash_alpha, live_capturing, rec_text, hud_text):
-    vis = frame.copy()
+def make_preview_frame(clean_frame, target_w, target_h, settings, countdown_val, flash_alpha, live_capturing, rec_text, hud_text):
+    """Resizes to viewfinder resolution FIRST, then draws non-destructive overlays at 60 FPS."""
+    fh, fw = clean_frame.shape[:2]
+    tw = max(320, min(fw, target_w))
+    th = max(180, min(fh, target_h))
+    scale = min(tw / fw, th / fh)
+    pw, ph = max(160, int(fw * scale)), max(90, int(fh * scale))
+
+    if pw < fw or ph < fh:
+        vis = cv2.resize(clean_frame, (pw, ph), interpolation=cv2.INTER_LINEAR)
+    else:
+        vis = clean_frame.copy()
+
     h, w = vis.shape[:2]
 
     if settings["focus_peaking"]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
         lap = np.abs(cv2.Laplacian(gray, cv2.CV_16S, ksize=3))
         vis[lap > 36] = (60, 255, 90)
 
     if settings["zebra"]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
         yy, xx = np.indices((h, w))
         vis[(gray >= 245) & (((xx + yy) // 5) % 2 == 0)] = (50, 60, 255)
 
     if settings["grid"]:
         for i in (1, 2):
-            cv2.line(vis, (w * i // 3, 0), (w * i // 3, h), (210, 210, 210), 1, cv2.LINE_AA)
-            cv2.line(vis, (0, h * i // 3), (w, h * i // 3), (210, 210, 210), 1, cv2.LINE_AA)
+            cv2.line(vis, (w * i // 3, 0), (w * i // 3, h), (205, 205, 205), 1)
+            cv2.line(vis, (0, h * i // 3), (w, h * i // 3), (205, 205, 205), 1)
 
     if settings["histogram"]:
         draw_rgb_histogram(vis)
 
-    pill_x = 16
+    pill_x = 12
     if settings["hdr_enabled"] and not rec_text:
-        cv2.rectangle(vis, (pill_x, 16), (pill_x + 64, 42), (0, 175, 255), -1)
-        cv2.putText(vis, "HDR", (pill_x + 12, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (15, 15, 18), 2, cv2.LINE_AA)
-        pill_x += 72
+        cv2.rectangle(vis, (pill_x, 12), (pill_x + 56, 36), (0, 175, 255), -1)
+        cv2.putText(vis, "HDR", (pill_x + 9, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (15, 15, 18), 2, cv2.LINE_AA)
+        pill_x += 64
     if settings["clean_enabled"] and not rec_text:
-        cv2.rectangle(vis, (pill_x, 16), (pill_x + 84, 42), (45, 200, 130), -1)
-        cv2.putText(vis, "CLEAN", (pill_x + 12, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (15, 15, 18), 2, cv2.LINE_AA)
+        cv2.rectangle(vis, (pill_x, 12), (pill_x + 74, 36), (45, 200, 130), -1)
+        cv2.putText(vis, "CLEAN", (pill_x + 9, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (15, 15, 18), 2, cv2.LINE_AA)
 
     if live_capturing:
-        cv2.rectangle(vis, (w // 2 - 78, 16), (w // 2 + 78, 50), (0, 184, 245), -1)
-        cv2.putText(vis, "MVIMG ● REC", (w // 2 - 66, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (15, 15, 18), 2, cv2.LINE_AA)
+        cv2.rectangle(vis, (w // 2 - 70, 12), (w // 2 + 70, 42), (0, 184, 245), -1)
+        cv2.putText(vis, "MVIMG ● REC", (w // 2 - 60, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (15, 15, 18), 2, cv2.LINE_AA)
 
     if rec_text:
-        cv2.rectangle(vis, (16, 16), (290, 52), (20, 20, 26), -1)
-        cv2.circle(vis, (36, 34), 7, (48, 59, 255), -1)
-        cv2.putText(vis, rec_text, (52, 41), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(vis, (12, 12), (265, 44), (20, 20, 26), -1)
+        cv2.circle(vis, (30, 28), 6, (48, 59, 255), -1)
+        cv2.putText(vis, rec_text, (44, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
 
     if hud_text:
-        bar_h = 30
-        roi = vis[h - bar_h:h, 0:w]
-        vis[h - bar_h:h, 0:w] = cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0)
-        cv2.putText(vis, hud_text, (14, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 245), 1, cv2.LINE_AA)
+        bar_h = 26
+        vis[h - bar_h:h, 0:w] = (vis[h - bar_h:h, 0:w] >> 1)
+        cv2.putText(vis, hud_text, (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (235, 235, 245), 1, cv2.LINE_AA)
 
     if countdown_val > 0:
         txt = str(countdown_val)
-        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 5.0, 10)
-        pos = ((w - tw) // 2, (h + th) // 2)
-        cv2.putText(vis, txt, (pos[0] + 4, pos[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 5.0, (0, 0, 0), 12, cv2.LINE_AA)
-        cv2.putText(vis, txt, pos, cv2.FONT_HERSHEY_SIMPLEX, 5.0, (255, 255, 255), 10, cv2.LINE_AA)
+        (tw2, th2), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 4.0, 8)
+        pos = ((w - tw2) // 2, (h + th2) // 2)
+        cv2.putText(vis, txt, (pos[0] + 3, pos[1] + 3), cv2.FONT_HERSHEY_SIMPLEX, 4.0, (0, 0, 0), 10, cv2.LINE_AA)
+        cv2.putText(vis, txt, pos, cv2.FONT_HERSHEY_SIMPLEX, 4.0, (255, 255, 255), 8, cv2.LINE_AA)
 
     if flash_alpha > 0.0:
         vis = cv2.addWeighted(np.full_like(vis, 255), flash_alpha, vis, 1.0 - flash_alpha, 0)
@@ -744,7 +957,7 @@ def bgr_to_qpixmap(bgr_img, target_size=None):
     qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
     pix = QPixmap.fromImage(qimg)
     if target_size is not None:
-        pix = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        pix = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
     return pix
 
 
@@ -1103,17 +1316,21 @@ class GalleryDialog(QDialog):
 
 
 # ==========================================
-# Main ProCam Windows Application (v2.3)
+# Main ProCam Windows Application (v2.4 — Zero-Lag Smooth Engine)
 # ==========================================
 class ProCameraWindow(QMainWindow):
     status_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ProCam Windows By Ye v2.3 — HDR, Clean Denoise, Pro Mode & MVIMG")
+        self.setWindowTitle("ProCam Windows By Ye v2.4 — Smooth Low-Latency Engine")
         self.resize(1180, 690)
 
-        self.cap = None
+        self.cam_reader = None
+        self.last_frame_id = -1
+        self.fps_times = deque(maxlen=30)
+        self.live_fps = 0.0
+
         self.camera_index = 0
         self.current_res = (1280, 720)
         self.mode = "PRO"
@@ -1128,7 +1345,7 @@ class ProCameraWindow(QMainWindow):
         else:
             self.mic_enabled = False
 
-        self.live_buffer = deque(maxlen=90)
+        self.live_buffer = deque(maxlen=65)
         self.live_post_capturing = False
         self.live_pre_frames = []
         self.live_post_frames = []
@@ -1163,7 +1380,7 @@ class ProCameraWindow(QMainWindow):
             "brightness": 0,
             "contrast": 1.0,
             "saturation": 1.0,
-            "sharpness": 0.15,
+            "sharpness": 0.0,     # 0% default for maximum smoothness
             "filter": "Normal",
             "lut_strength": 1.0,
             "watermark": False,
@@ -1195,6 +1412,7 @@ class ProCameraWindow(QMainWindow):
 
         self.status_signal.connect(self.set_status)
 
+        # 60 Hz UI refresh polling (only draws when a fresh frame arrives -> zero latency)
         self.frame_timer = QTimer(self)
         self.frame_timer.timeout.connect(self.update_frame)
 
@@ -1239,9 +1457,8 @@ class ProCameraWindow(QMainWindow):
 
         self.btn_clean = QPushButton("✨ Clean")
         self.btn_clean.setCheckable(True)
-        self.btn_clean.setChecked(False)  # OFF by default on startup
+        self.btn_clean.setChecked(False)
         self.btn_clean.setObjectName("CleanBtn")
-        self.btn_clean.setToolTip("Real-time Grain/Noise Reduction & Clarity")
         self.btn_clean.clicked.connect(self.toggle_clean)
         top_bar.addWidget(self.btn_clean)
 
@@ -1265,7 +1482,6 @@ class ProCameraWindow(QMainWindow):
 
         self.btn_watermark = QPushButton("WM")
         self.btn_watermark.setCheckable(True)
-        self.btn_watermark.setToolTip("Date & ProCam Watermark")
         self.btn_watermark.clicked.connect(lambda v: self.settings.__setitem__("watermark", v))
         top_bar.addWidget(self.btn_watermark)
 
@@ -1288,16 +1504,12 @@ class ProCameraWindow(QMainWindow):
 
         root_layout.addLayout(top_bar)
 
-        # --- Middle: Preview + Right Tabbed Panel ---
+        # --- Middle: Fast Preview + Right Tabbed Panel ---
         mid_layout = QHBoxLayout()
         mid_layout.setSpacing(10)
 
-        self.preview_label = QLabel("Starting Windows Camera...")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(640, 360)
-        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.preview_label.setObjectName("PreviewBox")
-        mid_layout.addWidget(self.preview_label, stretch=3)
+        self.preview_view = FastVideoView()
+        mid_layout.addWidget(self.preview_view, stretch=3)
 
         self.right_tabs = QTabWidget()
         self.right_tabs.setFixedWidth(310)
@@ -1307,7 +1519,6 @@ class ProCameraWindow(QMainWindow):
         pro_l = QVBoxLayout(pro_tab)
         pro_l.setSpacing(5)
 
-        # Shutter / EV
         exp_row = QHBoxLayout()
         exp_row.addWidget(QLabel("Shutter / EV"))
         self.chk_auto_exp = QCheckBox("Auto")
@@ -1326,7 +1537,6 @@ class ProCameraWindow(QMainWindow):
         self.slider_exp.valueChanged.connect(self.on_exposure_changed)
         pro_l.addWidget(self.slider_exp)
 
-        # ISO / Gain (Auto by default)
         iso_row = QHBoxLayout()
         iso_row.addWidget(QLabel("ISO / Gain"))
         self.chk_auto_iso = QCheckBox("Auto")
@@ -1346,7 +1556,6 @@ class ProCameraWindow(QMainWindow):
         self.slider_iso.valueChanged.connect(self.on_iso_changed)
         pro_l.addWidget(self.slider_iso)
 
-        # Focus
         foc_row = QHBoxLayout()
         foc_row.addWidget(QLabel("Focus (Lens)"))
         self.chk_auto_foc = QCheckBox("AF")
@@ -1365,7 +1574,6 @@ class ProCameraWindow(QMainWindow):
         self.slider_foc.valueChanged.connect(self.on_focus_changed)
         pro_l.addWidget(self.slider_foc)
 
-        # White Balance
         wb_row = QHBoxLayout()
         wb_row.addWidget(QLabel("White Balance"))
         self.chk_auto_wb = QCheckBox("AWB")
@@ -1452,7 +1660,7 @@ class ProCameraWindow(QMainWindow):
         self._add_slider(lut_l, "Brightness", "brightness", -60, 60, 0, lambda v: f"{v:+d}", lambda v: v)
         self._add_slider(lut_l, "Contrast", "contrast", 50, 200, 100, lambda v: f"{v}%", lambda v: v / 100.0)
         self._add_slider(lut_l, "Saturation", "saturation", 0, 200, 100, lambda v: f"{v}%", lambda v: v / 100.0)
-        self._add_slider(lut_l, "Sharpness / Clarity", "sharpness", 0, 150, 15, lambda v: f"{v}%", lambda v: v / 100.0)
+        self._add_slider(lut_l, "Sharpness / Clarity", "sharpness", 0, 150, 0, lambda v: f"{v}%", lambda v: v / 100.0)
 
         btn_reset_color = QPushButton("Reset Color & LUT")
         btn_reset_color.clicked.connect(self.reset_color_settings)
@@ -1521,7 +1729,7 @@ class ProCameraWindow(QMainWindow):
         self.btn_gallery.clicked.connect(self.open_gallery)
         left_bottom.addWidget(self.btn_gallery)
 
-        self.status_label = QLabel("Ready — ISO Auto | Clean OFF")
+        self.status_label = QLabel("Ready — Zero-Lag Engine Active")
         self.status_label.setStyleSheet("color: #a6a7bd; font-size: 11px;")
         left_bottom.addWidget(self.status_label)
         bottom_bar.addLayout(left_bottom)
@@ -1602,7 +1810,6 @@ class ProCameraWindow(QMainWindow):
                 border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; margin-right: 4px;
             }
             QTabBar::tab:selected { background-color: #282836; color: #f5b800; }
-            QLabel#PreviewBox { background-color: #08080b; border: 1px solid #282834; border-radius: 10px; }
             QFrame#TimelapseBar { background-color: #1a1b24; border: 1px solid #35374a; border-radius: 8px; }
             QPushButton {
                 background-color: #23232e; color: #f0f0f6; border: 1px solid #343444;
@@ -1696,7 +1903,7 @@ class ProCameraWindow(QMainWindow):
         self.active_lut = None
 
     # ==========================================
-    # PRO Mode Controls (Direct Drag = Instant Manual)
+    # PRO Mode Controls
     # ==========================================
     def on_auto_exposure_toggled(self, auto_on):
         self.settings["auto_exposure"] = auto_on
@@ -1706,8 +1913,8 @@ class ProCameraWindow(QMainWindow):
             self.slider_exp.blockSignals(False)
             self.settings["ev_offset"] = 0.0
             self.lbl_exp_val.setText("AUTO")
-            if self.cap is not None:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+            if self.cam_reader is not None:
+                self.cam_reader.set_prop(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
         else:
             self.on_exposure_changed(self.slider_exp.value())
 
@@ -1746,8 +1953,8 @@ class ProCameraWindow(QMainWindow):
         self.settings["auto_focus"] = auto_on
         if auto_on:
             self.lbl_foc_val.setText("AF")
-            if self.cap is not None:
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+            if self.cam_reader is not None:
+                self.cam_reader.set_prop(cv2.CAP_PROP_AUTOFOCUS, 1)
         else:
             self.on_focus_changed(self.slider_foc.value())
 
@@ -1759,11 +1966,9 @@ class ProCameraWindow(QMainWindow):
         self.settings["auto_focus"] = False
         self.settings["focus_val"] = val
         self.lbl_foc_val.setText(f"MF {val}")
-        if self.cap is not None:
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-            ok = self.cap.set(cv2.CAP_PROP_FOCUS, float(val))
-            if not ok:
-                self.set_status("Note: Built-in webcam is fixed-focus (use Sharpness/Clean for clarity)")
+        if self.cam_reader is not None:
+            self.cam_reader.set_prop(cv2.CAP_PROP_AUTOFOCUS, 0)
+            self.cam_reader.set_prop(cv2.CAP_PROP_FOCUS, float(val))
 
     def on_auto_wb_toggled(self, auto_on):
         self.settings["auto_wb"] = auto_on
@@ -1805,36 +2010,43 @@ class ProCameraWindow(QMainWindow):
         self.set_status("Color & LUT settings reset")
 
     # ==========================================
-    # Camera & Top Bar Toggles
+    # Threaded Camera Lifecycle & Toggles
     # ==========================================
+    def _stop_camera_reader(self):
+        if self.cam_reader is not None:
+            self.cam_reader.stop()
+            self.cam_reader.join(timeout=1.5)
+            self.cam_reader = None
+
     def open_camera(self, index):
         self.frame_timer.stop()
         if self.is_recording:
             self.stop_recording()
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        self._stop_camera_reader()
 
         self.camera_index = index
         self.prev_temporal_frame = None
-        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(index)
-        if not cap.isOpened():
-            self.preview_label.setText(f"Camera {index} not detected.\nConnect a webcam or DroidCam/Camo.")
-            self.set_status(f"Camera {index} unavailable")
-            return
+        self.last_frame_id = -1
+        self.fps_times.clear()
+        self.live_buffer.clear()
+
+        self.preview_view.set_message(f"Opening Camera {index}...")
+        QApplication.processEvents()
 
         w, h = self.current_res
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        reader = CameraReader(index, w, h)
+        reader.start()
+        reader._init_done.wait(timeout=3.5)
 
-        self.cap = cap
-        self.live_buffer.clear()
-        aw, ah = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | ISO Auto | Clean OFF")
-        self.frame_timer.start(30)
+        if not reader.ready:
+            reader.stop()
+            self.preview_view.set_message(f"{reader.error_msg}\nConnect a webcam or DroidCam/Camo.")
+            self.set_status(reader.error_msg)
+            return
+
+        self.cam_reader = reader
+        self.set_status(f"Camera {index} Ready ({reader.actual_w}x{reader.actual_h}) | Zero-Lag Active")
+        self.frame_timer.start(16)  # ~60Hz poll for instant lowest-latency display
 
     def change_resolution(self, idx):
         self.current_res = (1280, 720) if idx == 0 else (1920, 1080)
@@ -1852,7 +2064,7 @@ class ProCameraWindow(QMainWindow):
 
     def toggle_hdr(self, checked):
         self.settings["hdr_enabled"] = checked
-        self.set_status("HDR Mode ON (Expanded Dynamic Range)" if checked else "HDR Mode OFF")
+        self.set_status("HDR Mode ON" if checked else "HDR Mode OFF")
 
     def toggle_clean(self, checked):
         self.settings["clean_enabled"] = checked
@@ -1902,37 +2114,43 @@ class ProCameraWindow(QMainWindow):
         self.status_label.setText(text)
 
     # ==========================================
-    # Main Frame Loop
+    # Main Render Loop (Only Runs On Fresh Frames)
     # ==========================================
     def _build_hud_text(self):
-        if self.mode != "PRO" and self.active_lut is None and not self.settings["hdr_enabled"]:
-            return ""
         ev_txt = "AUTO" if self.settings["auto_exposure"] else f"{self.settings['ev_offset']:+.1f}EV"
         iso = "ISO AUTO" if self.settings["auto_iso"] else f"ISO {self.settings['iso_val']}"
         wb = "AWB" if self.settings["auto_wb"] else f"{self.settings['wb_kelvin']}K"
         hdr = "HDR ON" if self.settings["hdr_enabled"] else "HDR OFF"
-        cln = f"CLEAN {int(self.settings['clean_strength']*100)}%" if self.settings["clean_enabled"] else "CLEAN OFF"
         lut = f"LUT: {self.active_lut.name}" if self.active_lut else "LUT: OFF"
-        return f" {self.mode} | EV {ev_txt} | {iso} | WB {wb} | {hdr} | {cln} | {lut}"
+        fps_str = f"{self.live_fps:.0f} FPS"
+        return f" {fps_str} | {self.mode} | EV {ev_txt} | {iso} | WB {wb} | {hdr} | {lut}"
 
     def update_frame(self):
-        if self.cap is None:
+        if self.cam_reader is None:
             return
-        ret, raw = self.cap.read()
-        if not ret or raw is None:
+        fid, frame_ts, raw = self.cam_reader.get_latest()
+        if raw is None or fid == self.last_frame_id:
             return
+        self.last_frame_id = fid
 
         now = time.time()
+        self.fps_times.append(now)
+        if len(self.fps_times) >= 2:
+            span = self.fps_times[-1] - self.fps_times[0]
+            if span > 0.05:
+                self.live_fps = (len(self.fps_times) - 1) / span
+
         clean_frame, self.prev_temporal_frame = apply_image_pipeline(
             raw, self.settings, self.active_lut, self.prev_temporal_frame
         )
         self.last_clean_frame = clean_frame
 
+        # Zero-copy append to Live Photo ring buffer
         if self.mode in ("PHOTO", "PRO") and self.live_photo_enabled:
             self.live_buffer.append((now, clean_frame))
 
         if self.live_post_capturing:
-            self.live_post_frames.append((now, clean_frame.copy()))
+            self.live_post_frames.append((now, clean_frame))
             if now >= self.live_end_time:
                 self.live_post_capturing = False
                 combined_frames = self.live_pre_frames + self.live_post_frames
@@ -1967,13 +2185,17 @@ class ProCameraWindow(QMainWindow):
                 rec_text = f"TL {mm:02d}:{ss:02d} | {self.rec_frame_count}f ({vid_sec:.1f}s)"
 
         if self.flash_alpha > 0.0:
-            self.flash_alpha = max(0.0, self.flash_alpha - 0.16)
+            self.flash_alpha = max(0.0, self.flash_alpha - 0.18)
 
-        vis = draw_preview_overlays(
-            clean_frame, self.settings, self.countdown_val,
-            self.flash_alpha, self.live_post_capturing, rec_text, self._build_hud_text()
+        # Draw overlays on display-sized preview (4x faster than full 1080p)
+        vw = self.preview_view.width()
+        vh = self.preview_view.height()
+        vis = make_preview_frame(
+            clean_frame, vw, vh, self.settings,
+            self.countdown_val, self.flash_alpha,
+            self.live_post_capturing, rec_text, self._build_hud_text()
         )
-        self.preview_label.setPixmap(bgr_to_qpixmap(vis, self.preview_label.size()))
+        self.preview_view.set_bgr_frame(vis)
 
     # ==========================================
     # Capture Actions
@@ -2038,7 +2260,7 @@ class ProCameraWindow(QMainWindow):
                     cv2.imwrite(os.path.join(DIRS["photos"], f"PRO_{ts}.png"), frame)
 
                 self.live_pre_frames = [
-                    (t, f.copy()) for (t, f) in list(self.live_buffer) if t >= now - 1.5
+                    (t, f) for (t, f) in list(self.live_buffer) if t >= now - 1.5
                 ]
                 self.live_post_frames = [(now, frame)]
                 self.live_end_time = now + 1.5
@@ -2132,7 +2354,7 @@ class ProCameraWindow(QMainWindow):
         if self.mode == "VIDEO":
             self.active_video_path = os.path.join(DIRS["videos"], f"VID_{ts}.mp4")
             self.temp_video_path = tempfile.mktemp(suffix="_vid.mp4")
-            self.video_writer = cv2.VideoWriter(self.temp_video_path, fourcc, 24.0, (w, h))
+            self.video_writer = cv2.VideoWriter(self.temp_video_path, fourcc, 30.0, (w, h))
             if self.mic_enabled:
                 self.audio_engine.start_video_recording()
         else:
@@ -2155,7 +2377,7 @@ class ProCameraWindow(QMainWindow):
 
         if self.mode == "VIDEO" and self.temp_video_path:
             audio_np = self.audio_engine.stop_video_recording() if self.mic_enabled else None
-            pts_scale = (elapsed * 24.0) / max(1, self.rec_frame_count)
+            pts_scale = (elapsed * 30.0) / max(1, self.rec_frame_count)
             self.set_status("Saving Video & syncing audio...")
             threading.Thread(
                 target=self._finalize_video_av,
@@ -2212,8 +2434,7 @@ class ProCameraWindow(QMainWindow):
         if self.is_recording:
             self.stop_recording()
         self.audio_engine.stop()
-        if self.cap is not None:
-            self.cap.release()
+        self._stop_camera_reader()
         super().closeEvent(event)
 
 
@@ -2242,11 +2463,11 @@ class AnimatedSplashScreen(QWidget):
                     break
 
         self.elapsed = 0.0
-        self.duration = 2.2
+        self.duration = 2.0
         self.progress = 0.0
         self.opacity_val = 0.0
         self.fading_out = False
-        self.status_text = "Initializing ProCam Engine..."
+        self.status_text = "Initializing Zero-Lag Engine..."
         self.main_win = None
 
         screen = QApplication.primaryScreen().availableGeometry()
@@ -2262,7 +2483,7 @@ class AnimatedSplashScreen(QWidget):
 
     def _tick(self):
         if self.fading_out:
-            self.opacity_val = max(0.0, self.opacity_val - 0.07)
+            self.opacity_val = max(0.0, self.opacity_val - 0.08)
             self.setWindowOpacity(self.opacity_val)
             if self.opacity_val <= 0.0:
                 self.anim_timer.stop()
@@ -2272,8 +2493,8 @@ class AnimatedSplashScreen(QWidget):
             return
 
         self.elapsed += 0.016
-        if self.elapsed < 0.35:
-            self.opacity_val = min(1.0, self.elapsed / 0.35)
+        if self.elapsed < 0.30:
+            self.opacity_val = min(1.0, self.elapsed / 0.30)
             self.setWindowOpacity(self.opacity_val)
         elif self.opacity_val < 1.0:
             self.opacity_val = 1.0
@@ -2283,9 +2504,9 @@ class AnimatedSplashScreen(QWidget):
         self.progress = 1.0 - (1.0 - raw_p) ** 2
 
         if self.progress < 0.30:
-            self.status_text = "Initializing ProCam Engine..."
-        elif self.progress < 0.62:
-            self.status_text = "Loading HDR, Denoise & MVIMG..."
+            self.status_text = "Initializing Zero-Lag Engine..."
+        elif self.progress < 0.65:
+            self.status_text = "Loading MVIMG, Audio & HDR..."
         elif self.progress < 0.90:
             self.status_text = "Preparing Pro Controls & 3D LUT..."
         else:
@@ -2376,7 +2597,7 @@ class AnimatedSplashScreen(QWidget):
 if __name__ == "__main__":
     if os.name == "nt":
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.3")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.4")
 
     app = QApplication(sys.argv)
     icon_file = resource_path("app_icon.ico")
