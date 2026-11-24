@@ -450,7 +450,7 @@ def mux_video_audio_ffmpeg(temp_video, temp_wav, final_mp4, pts_scale=1.0):
     if abs(pts_scale - 1.0) > 0.02:
         cmd += ["-filter:v", f"setpts={pts_scale:.5f}*PTS"]
 
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "20"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "19"]
     if has_audio:
         cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
     cmd += ["-movflags", "+faststart", final_mp4]
@@ -475,7 +475,7 @@ def mux_video_audio_ffmpeg(temp_video, temp_wav, final_mp4, pts_scale=1.0):
 
 
 # ==========================================
-# Image Processing Pipeline
+# Image Quality: Denoise, Clarity, HDR & Pro Exposure
 # ==========================================
 def kelvin_to_bgr_gains(kelvin):
     temp = max(2500.0, min(8500.0, float(kelvin))) / 100.0
@@ -495,12 +495,97 @@ def kelvin_to_bgr_gains(kelvin):
     return gains / gains[1]
 
 
-def apply_image_pipeline(frame, settings, active_lut):
+def build_exposure_lut(ev_offset, iso_val):
+    """Smooth photographic EV + ISO tone curve with highlight protection."""
+    ev_gain = 2.0 ** (ev_offset * 0.55)
+    iso_gain = (iso_val / 400.0) ** 0.50
+    total_gain = ev_gain * iso_gain
+    if abs(total_gain - 1.0) < 0.015:
+        return None
+    x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    y = x * total_gain
+    if total_gain > 1.0:
+        # Soft highlight roll-off to prevent harsh white clipping
+        y = y / (1.0 + 0.38 * np.maximum(0.0, y - 0.65))
+    return np.clip(y * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def apply_clean_denoise_clarity(img, prev_frame, strength=1.0):
+    """
+    Removes laptop webcam color/luminance grain while preserving edges:
+    1. Motion-adaptive temporal averaging (kills static & low-light flicker noise)
+    2. YCrCb chroma noise suppression + edge-preserving luma smoothing + micro-clarity
+    """
+    out = img
+
+    # 1. Temporal Noise Reduction (motion-aware, no ghosting)
+    if prev_frame is not None and prev_frame.shape == out.shape:
+        diff = cv2.absdiff(out, prev_frame)
+        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        thresh = 16.0 + 12.0 * strength
+        motion = np.clip(gray_diff.astype(np.float32) / thresh, 0.0, 1.0)
+        motion = cv2.GaussianBlur(motion, (5, 5), 0)
+        min_alpha = max(0.24, 0.55 - 0.28 * strength)
+        alpha = (min_alpha + (1.0 - min_alpha) * motion)[:, :, None]
+        out = np.clip(
+            out.astype(np.float32) * alpha + prev_frame.astype(np.float32) * (1.0 - alpha),
+            0, 255
+        ).astype(np.uint8)
+
+    # 2. Chroma Grain Removal + Edge-Preserving Luma Smooth + Smart Clarity
+    ycrcb = cv2.cvtColor(out, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+
+    # Smooth purple/green color speckles heavily without softening edges
+    cr = cv2.GaussianBlur(cr, (5, 5), 0)
+    cb = cv2.GaussianBlur(cb, (5, 5), 0)
+
+    # Edge-preserving luminance denoise
+    sigma = int(16 + 18 * strength)
+    y_smooth = cv2.bilateralFilter(y, 5, sigma, sigma)
+
+    # Subtle clarity / local detail enhancement on denoised luminance
+    y_blur = cv2.GaussianBlur(y_smooth, (0, 0), 1.3)
+    clarity_amt = 0.28 * strength
+    y_clean = cv2.addWeighted(y_smooth, 1.0 + clarity_amt, y_blur, -clarity_amt, 0)
+
+    return cv2.cvtColor(cv2.merge((y_clean, cr, cb)), cv2.COLOR_YCrCb2BGR)
+
+
+def apply_hdr_effect(img, strength=1.0):
+    """Real-time Multi-Tone HDR: LAB CLAHE local contrast + shadow lift + natural vibrance."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    # Local dynamic range expansion
+    clahe = cv2.createCLAHE(clipLimit=2.3, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(l)
+
+    # Gentle shadow lift + highlight preservation
+    l_norm = l.astype(np.float32) / 255.0
+    l_lifted = np.power(l_norm, 0.80) * 255.0
+    l_hdr = np.clip(0.55 * l_clahe.astype(np.float32) + 0.45 * l_lifted, 0, 255).astype(np.uint8)
+
+    hdr_bgr = cv2.cvtColor(cv2.merge((l_hdr, a, b)), cv2.COLOR_LAB2BGR)
+
+    # Subtle vibrance boost so HDR looks rich and clear
+    hsv = cv2.cvtColor(hdr_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.14, 0, 255)
+    hdr_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    if strength < 0.99:
+        return cv2.addWeighted(hdr_bgr, strength, img, 1.0 - strength, 0)
+    return hdr_bgr
+
+
+def apply_image_pipeline(frame, settings, active_lut, prev_temporal=None):
     img = frame
 
+    # 1. Mirror
     if settings["mirror"]:
         img = cv2.flip(img, 1)
 
+    # 2. Digital Zoom (1.0x - 4.0x)
     zoom = settings["zoom"]
     if zoom > 1.01:
         h, w = img.shape[:2]
@@ -508,25 +593,45 @@ def apply_image_pipeline(frame, settings, active_lut):
         x1, y1 = (w - nw) // 2, (h - nh) // 2
         img = cv2.resize(img[y1:y1 + nh, x1:x1 + nw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-    if settings["use_sw_wb"]:
+    # 3. Real-time Denoise & Clarity (before gain/HDR so noise isn't amplified)
+    temporal_next = img
+    if settings["clean_enabled"] and settings["clean_strength"] > 0.05:
+        img = apply_clean_denoise_clarity(img, prev_temporal, settings["clean_strength"])
+        temporal_next = img
+
+    # 4. PRO Exposure (EV) & ISO / Gain (Guaranteed smooth response on all webcams)
+    ev_eff = 0.0 if settings["auto_exposure"] else settings["ev_offset"]
+    exp_lut = build_exposure_lut(ev_eff, settings["iso_val"])
+    if exp_lut is not None:
+        img = cv2.LUT(img, exp_lut)
+
+    # 5. PRO White Balance (Kelvin 2500K - 8500K)
+    if not settings["auto_wb"]:
         gains = kelvin_to_bgr_gains(settings["wb_kelvin"])
         img = np.clip(img.astype(np.float32) * gains[None, None, :], 0, 255).astype(np.uint8)
 
-    alpha = settings["contrast"] * settings["sw_iso_mult"]
-    if settings["brightness"] != 0 or abs(alpha - 1.0) > 0.01:
-        img = cv2.convertScaleAbs(img, alpha=alpha, beta=settings["brightness"])
+    # 6. HDR Mode
+    if settings["hdr_enabled"]:
+        img = apply_hdr_effect(img, settings["hdr_strength"])
 
+    # 7. Brightness & Contrast
+    if settings["brightness"] != 0 or abs(settings["contrast"] - 1.0) > 0.01:
+        img = cv2.convertScaleAbs(img, alpha=settings["contrast"], beta=settings["brightness"])
+
+    # 8. Saturation
     sat = settings["saturation"]
     if abs(sat - 1.0) > 0.01:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat, 0, 255)
         img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
+    # 9. Extra Sharpness
     sharp = settings["sharpness"]
     if sharp > 0.01:
-        blur = cv2.GaussianBlur(img, (0, 0), 1.5)
+        blur = cv2.GaussianBlur(img, (0, 0), 1.4)
         img = cv2.addWeighted(img, 1.0 + sharp, blur, -sharp, 0)
 
+    # 10. Built-in Color Looks
     flt = settings["filter"]
     if flt == "Vivid":
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -553,20 +658,23 @@ def apply_image_pipeline(frame, settings, active_lut):
         kernel = np.array([[0.272, 0.534, 0.131], [0.349, 0.686, 0.168], [0.393, 0.769, 0.189]])
         img = np.clip(cv2.transform(img, kernel), 0, 255).astype(np.uint8)
 
+    # 11. Custom .cube 3D LUT
     if active_lut is not None and settings["lut_strength"] > 0.01:
         img = active_lut.apply(img, settings["lut_strength"])
 
+    # 12. Watermark
     if settings["watermark"]:
         h, w = img.shape[:2]
-        lut_tag = f"  |  LUT: {active_lut.name}" if active_lut else ""
-        text = f"PROCAM WIN BY YE  |  {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}{lut_tag}"
+        hdr_tag = "  |  HDR" if settings["hdr_enabled"] else ""
+        lut_tag = f"  |  {active_lut.name}" if active_lut else ""
+        text = f"PROCAM WIN BY YE  |  {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}{hdr_tag}{lut_tag}"
         scale = max(0.45, w / 1920.0 * 0.7)
         thick = max(1, int(scale * 2))
         pos = (24, h - 22)
         cv2.putText(img, text, (pos[0] + 2, pos[1] + 2), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
         cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, (240, 240, 240), thick, cv2.LINE_AA)
 
-    return img
+    return img, temporal_next
 
 
 # ==========================================
@@ -574,8 +682,8 @@ def apply_image_pipeline(frame, settings, active_lut):
 # ==========================================
 def draw_rgb_histogram(vis):
     h, w = vis.shape[:2]
-    hw, hh = 196, 86
-    x0, y0 = w - hw - 16, 16
+    hw, hh = 180, 78
+    x0, y0 = w - hw - 14, 14
     if x0 < 0 or y0 + hh > h:
         return
 
@@ -588,7 +696,7 @@ def draw_rgb_histogram(vis):
     for ch, col in enumerate([(255, 110, 70), (80, 235, 110), (75, 85, 255)]):
         hist = cv2.calcHist([small], [ch], None, [bins], [0, 256]).flatten()
         if hist.max() > 0:
-            hist = (hist / hist.max()) * (hh - 12)
+            hist = (hist / hist.max()) * (hh - 10)
         pts = np.zeros((bins, 1, 2), dtype=np.int32)
         for i in range(bins):
             pts[i, 0, 0] = x0 + 4 + int(i * (hw - 8) / (bins - 1))
@@ -603,7 +711,7 @@ def draw_preview_overlays(frame, settings, countdown_val, flash_alpha, live_capt
     if settings["focus_peaking"]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         lap = np.abs(cv2.Laplacian(gray, cv2.CV_16S, ksize=3))
-        vis[lap > 38] = (60, 255, 90)
+        vis[lap > 36] = (60, 255, 90)
 
     if settings["zebra"]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -618,20 +726,30 @@ def draw_preview_overlays(frame, settings, countdown_val, flash_alpha, live_capt
     if settings["histogram"]:
         draw_rgb_histogram(vis)
 
+    # Top-left HDR / Clean status pills
+    pill_x = 16
+    if settings["hdr_enabled"] and not rec_text:
+        cv2.rectangle(vis, (pill_x, 16), (pill_x + 64, 42), (0, 175, 255), -1)
+        cv2.putText(vis, "HDR", (pill_x + 12, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (15, 15, 18), 2, cv2.LINE_AA)
+        pill_x += 72
+    if settings["clean_enabled"] and not rec_text:
+        cv2.rectangle(vis, (pill_x, 16), (pill_x + 84, 42), (45, 200, 130), -1)
+        cv2.putText(vis, "CLEAN", (pill_x + 12, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (15, 15, 18), 2, cv2.LINE_AA)
+
     if live_capturing:
         cv2.rectangle(vis, (w // 2 - 78, 16), (w // 2 + 78, 50), (0, 184, 245), -1)
         cv2.putText(vis, "MVIMG ● REC", (w // 2 - 66, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (15, 15, 18), 2, cv2.LINE_AA)
 
     if rec_text:
-        cv2.rectangle(vis, (16, 16), (250, 52), (20, 20, 26), -1)
+        cv2.rectangle(vis, (16, 16), (290, 52), (20, 20, 26), -1)
         cv2.circle(vis, (36, 34), 7, (48, 59, 255), -1)
-        cv2.putText(vis, rec_text, (52, 41), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(vis, rec_text, (52, 41), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (255, 255, 255), 2, cv2.LINE_AA)
 
     if hud_text:
-        bar_h = 32
+        bar_h = 30
         roi = vis[h - bar_h:h, 0:w]
         vis[h - bar_h:h, 0:w] = cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0)
-        cv2.putText(vis, hud_text, (16, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (235, 235, 245), 1, cv2.LINE_AA)
+        cv2.putText(vis, hud_text, (14, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 245), 1, cv2.LINE_AA)
 
     if countdown_val > 0:
         txt = str(countdown_val)
@@ -790,7 +908,7 @@ class GalleryDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ProCam Gallery — MVIMG Motion Photo & Audio Viewer")
-        self.resize(1060, 660)
+        self.resize(1020, 620)
         self.temp_dir = tempfile.mkdtemp(prefix="procam_mvimg_")
         self.extracted_cache = {}
 
@@ -817,7 +935,7 @@ class GalleryDialog(QDialog):
         left_box.addWidget(title)
 
         self.file_list = QListWidget()
-        self.file_list.setFixedWidth(315)
+        self.file_list.setFixedWidth(300)
         self.file_list.currentItemChanged.connect(self.on_select_item)
         left_box.addWidget(self.file_list)
 
@@ -832,7 +950,7 @@ class GalleryDialog(QDialog):
         right_box.addWidget(self.hint_label)
 
         self.viewer = LivePhotoLabel()
-        self.viewer.setMinimumSize(640, 440)
+        self.viewer.setMinimumSize(600, 400)
         self.viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_box.addWidget(self.viewer)
 
@@ -1011,15 +1129,15 @@ class GalleryDialog(QDialog):
 
 
 # ==========================================
-# Main ProCam Windows Application
+# Main ProCam Windows Application (v2.2)
 # ==========================================
 class ProCameraWindow(QMainWindow):
     status_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ProCam Windows By Ye — MVIMG Motion Photo, LUT & Pro Mode")
-        self.resize(1340, 810)
+        self.setWindowTitle("ProCam Windows By Ye v2.2 — HDR, Clean Denoise, Pro Mode & MVIMG")
+        self.resize(1180, 690)
 
         self.cap = None
         self.camera_index = 0
@@ -1054,13 +1172,17 @@ class ProCameraWindow(QMainWindow):
         self.active_video_path = ""
         self.rec_start_time = 0.0
         self.rec_frame_count = 0
+
+        # Time-Lapse configurable settings
         self.timelapse_interval = 1.0
+        self.timelapse_fps = 30.0
         self.timelapse_last_grab = 0.0
 
         self.burst_remaining = 0
         self.countdown_val = 0
         self.flash_alpha = 0.0
         self.last_clean_frame = None
+        self.prev_temporal_frame = None
 
         self.settings = {
             "mirror": True,
@@ -1068,21 +1190,25 @@ class ProCameraWindow(QMainWindow):
             "brightness": 0,
             "contrast": 1.0,
             "saturation": 1.0,
-            "sharpness": 0.0,
+            "sharpness": 0.15,
             "filter": "Normal",
             "lut_strength": 1.0,
             "watermark": False,
             "grid": True,
             "timer": 0,
+            # HDR & Clean Denoise
+            "hdr_enabled": False,
+            "hdr_strength": 0.85,
+            "clean_enabled": True,
+            "clean_strength": 0.85,
+            # PRO Mode (Always responsive)
             "auto_exposure": True,
-            "exposure_ev": -6,
-            "iso_val": 400,
-            "sw_iso_mult": 1.0,
+            "ev_offset": 0.0,      # -3.0 to +3.0 EV
+            "iso_val": 400,        # 100 to 3200
             "auto_focus": True,
             "focus_val": 50,
             "auto_wb": True,
-            "wb_kelvin": 5500,
-            "use_sw_wb": False,
+            "wb_kelvin": 5500,     # 2500K to 8500K
             "histogram": True,
             "focus_peaking": False,
             "zebra": False,
@@ -1110,50 +1236,67 @@ class ProCameraWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(14, 10, 14, 10)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(10, 8, 10, 8)
+        root_layout.setSpacing(6)
 
+        # --- Top Bar ---
         top_bar = QHBoxLayout()
+        top_bar.setSpacing(6)
 
-        self.btn_live = QPushButton("◉ LIVE ON")
+        self.btn_live = QPushButton("◉ LIVE")
         self.btn_live.setCheckable(True)
         self.btn_live.setChecked(True)
         self.btn_live.setObjectName("LiveBtn")
         self.btn_live.clicked.connect(self.toggle_live_photo)
         top_bar.addWidget(self.btn_live)
 
-        self.btn_mvimg = QPushButton("MVIMG: ON")
+        self.btn_mvimg = QPushButton("MVIMG")
         self.btn_mvimg.setCheckable(True)
         self.btn_mvimg.setChecked(True)
         self.btn_mvimg.clicked.connect(self.toggle_mvimg_format)
         top_bar.addWidget(self.btn_mvimg)
 
-        self.btn_mic = QPushButton("🎙 Mic: ON" if self.mic_enabled else "🔇 Mic: OFF")
+        self.btn_hdr = QPushButton("HDR")
+        self.btn_hdr.setCheckable(True)
+        self.btn_hdr.setChecked(False)
+        self.btn_hdr.setObjectName("HdrBtn")
+        self.btn_hdr.clicked.connect(self.toggle_hdr)
+        top_bar.addWidget(self.btn_hdr)
+
+        self.btn_clean = QPushButton("✨ Clean")
+        self.btn_clean.setCheckable(True)
+        self.btn_clean.setChecked(True)
+        self.btn_clean.setObjectName("CleanBtn")
+        self.btn_clean.setToolTip("Real-time Grain/Noise Reduction & Clarity")
+        self.btn_clean.clicked.connect(self.toggle_clean)
+        top_bar.addWidget(self.btn_clean)
+
+        self.btn_mic = QPushButton("🎙 Mic" if self.mic_enabled else "🔇 Mic")
         self.btn_mic.setCheckable(True)
         self.btn_mic.setChecked(self.mic_enabled)
         self.btn_mic.clicked.connect(self.toggle_mic)
         top_bar.addWidget(self.btn_mic)
 
-        self.btn_grid = QPushButton("Grid: ON")
+        self.btn_grid = QPushButton("Grid")
         self.btn_grid.setCheckable(True)
         self.btn_grid.setChecked(True)
         self.btn_grid.clicked.connect(self.toggle_grid)
         top_bar.addWidget(self.btn_grid)
 
-        self.btn_mirror = QPushButton("Mirror: ON")
+        self.btn_mirror = QPushButton("Mirror")
         self.btn_mirror.setCheckable(True)
         self.btn_mirror.setChecked(True)
         self.btn_mirror.clicked.connect(self.toggle_mirror)
         top_bar.addWidget(self.btn_mirror)
 
-        self.btn_watermark = QPushButton("Watermark")
+        self.btn_watermark = QPushButton("WM")
         self.btn_watermark.setCheckable(True)
+        self.btn_watermark.setToolTip("Date & ProCam Watermark")
         self.btn_watermark.clicked.connect(lambda v: self.settings.__setitem__("watermark", v))
         top_bar.addWidget(self.btn_watermark)
 
-        top_bar.addWidget(QLabel("Timer:"))
         self.combo_timer = QComboBox()
-        self.combo_timer.addItems(["Off", "3s", "5s", "10s"])
+        self.combo_timer.addItems(["Timer: Off", "Timer: 3s", "Timer: 5s", "Timer: 10s"])
         self.combo_timer.currentIndexChanged.connect(lambda i: self.settings.__setitem__("timer", [0, 3, 5, 10][i]))
         top_bar.addWidget(self.combo_timer)
 
@@ -1171,26 +1314,27 @@ class ProCameraWindow(QMainWindow):
 
         root_layout.addLayout(top_bar)
 
+        # --- Middle: Preview + Right Tabbed Panel ---
         mid_layout = QHBoxLayout()
-        mid_layout.setSpacing(14)
+        mid_layout.setSpacing(10)
 
         self.preview_label = QLabel("Starting Windows Camera...")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(860, 540)
+        self.preview_label.setMinimumSize(640, 360)
         self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.preview_label.setObjectName("PreviewBox")
         mid_layout.addWidget(self.preview_label, stretch=3)
 
         self.right_tabs = QTabWidget()
-        self.right_tabs.setFixedWidth(330)
+        self.right_tabs.setFixedWidth(310)
 
-        # TAB 1: PRO MANUAL
+        # TAB 1: PRO MANUAL (All sliders ALWAYS enabled — dragging auto-switches to Manual)
         pro_tab = QWidget()
         pro_l = QVBoxLayout(pro_tab)
-        pro_l.setSpacing(8)
+        pro_l.setSpacing(5)
 
         exp_row = QHBoxLayout()
-        exp_row.addWidget(QLabel("Shutter / Exposure"))
+        exp_row.addWidget(QLabel("Shutter / EV"))
         self.chk_auto_exp = QCheckBox("Auto")
         self.chk_auto_exp.setChecked(True)
         self.chk_auto_exp.toggled.connect(self.on_auto_exposure_toggled)
@@ -1202,9 +1346,8 @@ class ProCameraWindow(QMainWindow):
         pro_l.addLayout(exp_row)
 
         self.slider_exp = QSlider(Qt.Orientation.Horizontal)
-        self.slider_exp.setRange(-13, -1)
-        self.slider_exp.setValue(-6)
-        self.slider_exp.setEnabled(False)
+        self.slider_exp.setRange(-30, 30)  # -3.0 EV to +3.0 EV
+        self.slider_exp.setValue(0)
         self.slider_exp.valueChanged.connect(self.on_exposure_changed)
         pro_l.addWidget(self.slider_exp)
 
@@ -1218,13 +1361,13 @@ class ProCameraWindow(QMainWindow):
 
         self.slider_iso = QSlider(Qt.Orientation.Horizontal)
         self.slider_iso.setRange(100, 3200)
-        self.slider_iso.setSingleStep(100)
+        self.slider_iso.setSingleStep(50)
         self.slider_iso.setValue(400)
         self.slider_iso.valueChanged.connect(self.on_iso_changed)
         pro_l.addWidget(self.slider_iso)
 
         foc_row = QHBoxLayout()
-        foc_row.addWidget(QLabel("Focus"))
+        foc_row.addWidget(QLabel("Focus (Lens)"))
         self.chk_auto_foc = QCheckBox("AF")
         self.chk_auto_foc.setChecked(True)
         self.chk_auto_foc.toggled.connect(self.on_auto_focus_toggled)
@@ -1238,7 +1381,6 @@ class ProCameraWindow(QMainWindow):
         self.slider_foc = QSlider(Qt.Orientation.Horizontal)
         self.slider_foc.setRange(0, 255)
         self.slider_foc.setValue(50)
-        self.slider_foc.setEnabled(False)
         self.slider_foc.valueChanged.connect(self.on_focus_changed)
         pro_l.addWidget(self.slider_foc)
 
@@ -1258,35 +1400,37 @@ class ProCameraWindow(QMainWindow):
         self.slider_wb.setRange(2500, 8500)
         self.slider_wb.setSingleStep(100)
         self.slider_wb.setValue(5500)
-        self.slider_wb.setEnabled(False)
         self.slider_wb.valueChanged.connect(self.on_wb_changed)
         pro_l.addWidget(self.slider_wb)
+
+        # Clarity / Clean Strength & HDR Strength right in Pro tab
+        self.sliders = {}
+        self._add_slider(pro_l, "Clean / Denoise Level", "clean_strength", 0, 100, 85, lambda v: f"{v}%", lambda v: v / 100.0)
+        self._add_slider(pro_l, "HDR Intensity", "hdr_strength", 0, 100, 85, lambda v: f"{v}%", lambda v: v / 100.0)
 
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
         div.setStyleSheet("color: #2f2f3d;")
         pro_l.addWidget(div)
 
-        pro_l.addWidget(QLabel("PRO VIEWFINDER TOOLS"))
-
         self.chk_hist = QCheckBox("Live RGB Histogram")
         self.chk_hist.setChecked(True)
         self.chk_hist.toggled.connect(lambda v: self.settings.__setitem__("histogram", v))
         pro_l.addWidget(self.chk_hist)
 
-        self.chk_peaking = QCheckBox("Focus Peaking (Sharp Edge Highlight)")
+        self.chk_peaking = QCheckBox("Focus Peaking (Sharp Edges)")
         self.chk_peaking.toggled.connect(lambda v: self.settings.__setitem__("focus_peaking", v))
         pro_l.addWidget(self.chk_peaking)
 
-        self.chk_zebra = QCheckBox("Zebra Stripes (Overexposure >95%)")
+        self.chk_zebra = QCheckBox("Zebra Stripes (Overexposure)")
         self.chk_zebra.toggled.connect(lambda v: self.settings.__setitem__("zebra", v))
         pro_l.addWidget(self.chk_zebra)
 
-        self.chk_png = QCheckBox("Also Save Lossless PNG (PRO Mode)")
+        self.chk_png = QCheckBox("Save Lossless PNG (PRO Mode)")
         self.chk_png.toggled.connect(lambda v: self.settings.__setitem__("save_png", v))
         pro_l.addWidget(self.chk_png)
 
-        btn_reset_pro = QPushButton("Reset All to Auto")
+        btn_reset_pro = QPushButton("Reset Pro to Auto")
         btn_reset_pro.clicked.connect(self.reset_hardware_pro)
         pro_l.addWidget(btn_reset_pro)
 
@@ -1296,7 +1440,7 @@ class ProCameraWindow(QMainWindow):
         # TAB 2: LUT & COLOR
         lut_tab = QWidget()
         lut_l = QVBoxLayout(lut_tab)
-        lut_l.setSpacing(8)
+        lut_l.setSpacing(6)
 
         lut_hdr = QLabel("CUSTOM 3D LUT (.cube)")
         lut_hdr.setStyleSheet("color: #f5b800; font-weight: bold;")
@@ -1315,7 +1459,6 @@ class ProCameraWindow(QMainWindow):
         self.combo_lut.currentTextChanged.connect(self.on_lut_selected)
         lut_l.addWidget(self.combo_lut)
 
-        self.sliders = {}
         self._add_slider(lut_l, "LUT Strength", "lut_strength", 0, 100, 100, lambda v: f"{v}%", lambda v: v / 100.0)
 
         lut_l.addWidget(QLabel("Built-in Color Look"))
@@ -1328,7 +1471,7 @@ class ProCameraWindow(QMainWindow):
         self._add_slider(lut_l, "Brightness", "brightness", -60, 60, 0, lambda v: f"{v:+d}", lambda v: v)
         self._add_slider(lut_l, "Contrast", "contrast", 50, 200, 100, lambda v: f"{v}%", lambda v: v / 100.0)
         self._add_slider(lut_l, "Saturation", "saturation", 0, 200, 100, lambda v: f"{v}%", lambda v: v / 100.0)
-        self._add_slider(lut_l, "Sharpness", "sharpness", 0, 150, 0, lambda v: f"{v}%", lambda v: v / 100.0)
+        self._add_slider(lut_l, "Sharpness / Clarity", "sharpness", 0, 150, 15, lambda v: f"{v}%", lambda v: v / 100.0)
 
         btn_reset_color = QPushButton("Reset Color & LUT")
         btn_reset_color.clicked.connect(self.reset_color_settings)
@@ -1338,27 +1481,78 @@ class ProCameraWindow(QMainWindow):
         self.right_tabs.addTab(lut_tab, "LUT & COLOR")
 
         mid_layout.addWidget(self.right_tabs, stretch=1)
-        root_layout.addLayout(mid_layout)
+        root_layout.addLayout(mid_layout, stretch=1)
 
+        # --- Time-Lapse Control Bar (Visible automatically when TIMELAPSE mode active) ---
+        self.tl_bar = QFrame()
+        self.tl_bar.setObjectName("TimelapseBar")
+        tl_layout = QHBoxLayout(self.tl_bar)
+        tl_layout.setContentsMargins(12, 6, 12, 6)
+        tl_layout.setSpacing(12)
+
+        tl_title = QLabel("⏱ TIMELAPSE SETTINGS")
+        tl_title.setStyleSheet("color: #f5b800; font-weight: bold;")
+        tl_layout.addWidget(tl_title)
+
+        tl_layout.addWidget(QLabel("Interval:"))
+        self.combo_tl_interval = QComboBox()
+        self.tl_intervals = [
+            ("0.2 sec (Fast)", 0.2),
+            ("0.5 sec", 0.5),
+            ("1 sec (Standard)", 1.0),
+            ("2 sec", 2.0),
+            ("3 sec", 3.0),
+            ("5 sec (Clouds)", 5.0),
+            ("10 sec (Sunset)", 10.0),
+            ("30 sec (Long)", 30.0),
+            ("60 sec (1 min)", 60.0),
+        ]
+        for lbl, _ in self.tl_intervals:
+            self.combo_tl_interval.addItem(lbl)
+        self.combo_tl_interval.setCurrentIndex(2)
+        self.combo_tl_interval.currentIndexChanged.connect(self.update_timelapse_settings)
+        tl_layout.addWidget(self.combo_tl_interval)
+
+        tl_layout.addWidget(QLabel("Output FPS:"))
+        self.combo_tl_fps = QComboBox()
+        self.tl_fps_vals = [24.0, 30.0, 60.0]
+        self.combo_tl_fps.addItems(["24 fps (Cinema)", "30 fps (Smooth)", "60 fps (Ultra)"])
+        self.combo_tl_fps.setCurrentIndex(1)
+        self.combo_tl_fps.currentIndexChanged.connect(self.update_timelapse_settings)
+        tl_layout.addWidget(self.combo_tl_fps)
+
+        self.lbl_tl_speed = QLabel("Speed: 30x  (1 min real → 2.0s video)")
+        self.lbl_tl_speed.setStyleSheet("color: #46e095; font-weight: bold;")
+        tl_layout.addWidget(self.lbl_tl_speed)
+        tl_layout.addStretch()
+
+        self.tl_bar.setVisible(False)
+        root_layout.addWidget(self.tl_bar)
+
+        # --- Bottom Bar (Compact so shutter never clips) ---
         bottom_bar = QHBoxLayout()
+        bottom_bar.setContentsMargins(4, 2, 4, 2)
 
         left_bottom = QVBoxLayout()
-        self.btn_gallery = QPushButton("🖼 Gallery & MVIMG Viewer")
-        self.btn_gallery.setFixedHeight(44)
+        left_bottom.setSpacing(2)
+        self.btn_gallery = QPushButton("🖼 Gallery & MVIMG")
+        self.btn_gallery.setFixedHeight(38)
         self.btn_gallery.clicked.connect(self.open_gallery)
         left_bottom.addWidget(self.btn_gallery)
 
-        self.status_label = QLabel("Ready — Android MVIMG Motion Photo (Audio + Xiaomi/Google Ready)")
-        self.status_label.setStyleSheet("color: #a6a7bd; font-size: 12px;")
+        self.status_label = QLabel("Ready — Clean Denoise ON | Drag any Pro slider to adjust")
+        self.status_label.setStyleSheet("color: #a6a7bd; font-size: 11px;")
         left_bottom.addWidget(self.status_label)
         bottom_bar.addLayout(left_bottom)
 
         bottom_bar.addStretch()
 
         center_bottom = QVBoxLayout()
+        center_bottom.setSpacing(4)
         center_bottom.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
         self.mode_group = QButtonGroup(self)
         for m in ["PHOTO", "PRO", "VIDEO", "BURST", "TIMELAPSE"]:
             btn = QPushButton(m)
@@ -1374,7 +1568,7 @@ class ProCameraWindow(QMainWindow):
         shutter_row = QHBoxLayout()
         shutter_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.btn_shutter = QPushButton("●")
-        self.btn_shutter.setFixedSize(68, 68)
+        self.btn_shutter.setFixedSize(58, 58)
         self.btn_shutter.setObjectName("ShutterBtn")
         self.btn_shutter.clicked.connect(self.trigger_shutter)
         shutter_row.addWidget(self.btn_shutter)
@@ -1384,12 +1578,13 @@ class ProCameraWindow(QMainWindow):
         bottom_bar.addStretch()
 
         right_bottom = QVBoxLayout()
+        right_bottom.setSpacing(2)
         btn_folder = QPushButton("📁 Open Captures")
-        btn_folder.setFixedHeight(44)
+        btn_folder.setFixedHeight(38)
         btn_folder.clicked.connect(lambda: os.startfile(BASE_DIR))
         right_bottom.addWidget(btn_folder)
 
-        hint = QLabel("Space: Shoot | L: Live | P: Peaking | H: Hist")
+        hint = QLabel("Space: Shoot | L: Live | D: Clean | H: HDR")
         hint.setStyleSheet("color: #7d7e94; font-size: 11px;")
         right_bottom.addWidget(hint)
         bottom_bar.addLayout(right_bottom)
@@ -1419,37 +1614,56 @@ class ProCameraWindow(QMainWindow):
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background-color: #111116; color: #f0f0f6; font-family: 'Segoe UI'; }
-            QTabWidget::pane { background-color: #191921; border: 1px solid #2b2b36; border-radius: 10px; padding: 8px; }
+            QMainWindow, QWidget { background-color: #111116; color: #f0f0f6; font-family: 'Segoe UI'; font-size: 12px; }
+            QTabWidget::pane { background-color: #191921; border: 1px solid #2b2b36; border-radius: 10px; padding: 6px; }
             QTabBar::tab {
-                background-color: #1c1c25; color: #9a9bb2; padding: 8px 16px;
+                background-color: #1c1c25; color: #9a9bb2; padding: 7px 14px;
                 border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; margin-right: 4px;
             }
             QTabBar::tab:selected { background-color: #282836; color: #f5b800; }
-            QLabel#PreviewBox { background-color: #08080b; border: 1px solid #282834; border-radius: 12px; }
+            QLabel#PreviewBox { background-color: #08080b; border: 1px solid #282834; border-radius: 10px; }
+            QFrame#TimelapseBar { background-color: #1a1b24; border: 1px solid #35374a; border-radius: 8px; }
             QPushButton {
                 background-color: #23232e; color: #f0f0f6; border: 1px solid #343444;
-                border-radius: 8px; padding: 7px 12px; font-weight: 600;
+                border-radius: 7px; padding: 6px 10px; font-weight: 600;
             }
             QPushButton:hover { background-color: #2f2f3d; }
             QPushButton:checked { background-color: #2d5bff; border-color: #557bff; color: white; }
             QPushButton#LiveBtn:checked { background-color: #f5b800; border-color: #ffd042; color: #121216; }
+            QPushButton#HdrBtn:checked { background-color: #00b4ff; border-color: #66d4ff; color: #0e1015; }
+            QPushButton#CleanBtn:checked { background-color: #20b878; border-color: #4ee0a1; color: #0c1410; }
             QPushButton#ModeBtn {
                 background-color: transparent; border: none; color: #8f90a6;
-                padding: 4px 12px; font-size: 12px; letter-spacing: 1px;
+                padding: 3px 10px; font-size: 12px; letter-spacing: 1px;
             }
             QPushButton#ModeBtn:checked {
                 background-color: transparent; color: #f5b800; border-bottom: 2px solid #f5b800; border-radius: 0px;
             }
             QPushButton#ShutterBtn {
-                background-color: #f4f4f8; color: #15151a; border: 4px solid #6a6a7c; border-radius: 34px; font-size: 26px;
+                background-color: #f4f4f8; color: #15151a; border: 4px solid #6a6a7c; border-radius: 29px; font-size: 22px;
             }
             QPushButton#ShutterBtn:hover { background-color: #ffffff; border-color: #f5b800; }
-            QComboBox { background-color: #23232e; border: 1px solid #353545; border-radius: 6px; padding: 5px 10px; color: #f0f0f6; }
+            QComboBox { background-color: #23232e; border: 1px solid #353545; border-radius: 6px; padding: 4px 8px; color: #f0f0f6; }
             QSlider::groove:horizontal { height: 5px; background: #2c2c38; border-radius: 2px; }
-            QSlider::handle:horizontal { background: #f5b800; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
+            QSlider::handle:horizontal { background: #f5b800; width: 13px; height: 13px; margin: -4px 0; border-radius: 6px; }
         """)
 
+    # ==========================================
+    # Time-Lapse Settings Handler
+    # ==========================================
+    def update_timelapse_settings(self):
+        idx = self.combo_tl_interval.currentIndex()
+        fidx = self.combo_tl_fps.currentIndex()
+        self.timelapse_interval = self.tl_intervals[idx][1]
+        self.timelapse_fps = self.tl_fps_vals[fidx]
+        speed = self.timelapse_interval * self.timelapse_fps
+        out_sec = 60.0 / speed
+        self.lbl_tl_speed.setText(f"Speed: {speed:.0f}x  (1 min real → {out_sec:.1f}s video)")
+        self.set_status(f"Timelapse: 1 frame every {self.timelapse_interval}s @ {int(self.timelapse_fps)}fps")
+
+    # ==========================================
+    # LUT Management
+    # ==========================================
     def _scan_luts_folder(self):
         self.combo_lut.blockSignals(True)
         self.combo_lut.clear()
@@ -1500,86 +1714,99 @@ class ProCameraWindow(QMainWindow):
         self.combo_lut.setCurrentIndex(0)
         self.active_lut = None
 
+    # ==========================================
+    # PRO Mode Controls (Direct Drag = Instant Manual)
+    # ==========================================
     def on_auto_exposure_toggled(self, auto_on):
         self.settings["auto_exposure"] = auto_on
-        self.slider_exp.setEnabled(not auto_on)
-        if self.cap is None:
-            return
         if auto_on:
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+            self.slider_exp.blockSignals(True)
+            self.slider_exp.setValue(0)
+            self.slider_exp.blockSignals(False)
+            self.settings["ev_offset"] = 0.0
             self.lbl_exp_val.setText("AUTO")
+            if self.cap is not None:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
         else:
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             self.on_exposure_changed(self.slider_exp.value())
 
-    def on_exposure_changed(self, ev):
-        self.settings["exposure_ev"] = ev
-        self.lbl_exp_val.setText(f"1/{int(2 ** abs(ev))}s (EV {ev})")
-        if self.cap is not None and not self.settings["auto_exposure"]:
-            self.cap.set(cv2.CAP_PROP_EXPOSURE, float(ev))
+    def on_exposure_changed(self, raw_val):
+        # Dragging slider automatically switches to Manual EV
+        if self.chk_auto_exp.isChecked():
+            self.chk_auto_exp.blockSignals(True)
+            self.chk_auto_exp.setChecked(False)
+            self.chk_auto_exp.blockSignals(False)
+        self.settings["auto_exposure"] = False
+        ev = raw_val / 10.0  # -3.0 to +3.0 EV
+        self.settings["ev_offset"] = ev
+        shutter_denom = max(4, min(1000, int(round(60.0 / (2.0 ** ev)))))
+        self.lbl_exp_val.setText(f"1/{shutter_denom}s ({ev:+.1f}EV)")
 
     def on_iso_changed(self, iso):
         self.settings["iso_val"] = iso
         self.lbl_iso_val.setText(f"ISO {iso}")
-        hw_ok = False
-        if self.cap is not None:
-            hw_ok = self.cap.set(cv2.CAP_PROP_GAIN, float(int((iso - 100) / 3100.0 * 100.0)))
-        self.settings["sw_iso_mult"] = 1.0 if hw_ok else max(0.65, min(2.2, (iso / 400.0) ** 0.45))
 
     def on_auto_focus_toggled(self, auto_on):
         self.settings["auto_focus"] = auto_on
-        self.slider_foc.setEnabled(not auto_on)
-        if self.cap is None:
-            return
         if auto_on:
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
             self.lbl_foc_val.setText("AF")
+            if self.cap is not None:
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
         else:
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
             self.on_focus_changed(self.slider_foc.value())
 
     def on_focus_changed(self, val):
+        if self.chk_auto_foc.isChecked():
+            self.chk_auto_foc.blockSignals(True)
+            self.chk_auto_foc.setChecked(False)
+            self.chk_auto_foc.blockSignals(False)
+        self.settings["auto_focus"] = False
         self.settings["focus_val"] = val
         self.lbl_foc_val.setText(f"MF {val}")
-        if self.cap is not None and not self.settings["auto_focus"]:
-            self.cap.set(cv2.CAP_PROP_FOCUS, float(val))
+        if self.cap is not None:
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            ok = self.cap.set(cv2.CAP_PROP_FOCUS, float(val))
+            if not ok:
+                self.set_status("Note: Built-in webcam is fixed-focus (use Sharpness/Clean for clarity)")
 
     def on_auto_wb_toggled(self, auto_on):
         self.settings["auto_wb"] = auto_on
-        self.slider_wb.setEnabled(not auto_on)
         if auto_on:
-            self.settings["use_sw_wb"] = False
+            self.slider_wb.blockSignals(True)
+            self.slider_wb.setValue(5500)
+            self.slider_wb.blockSignals(False)
+            self.settings["wb_kelvin"] = 5500
             self.lbl_wb_val.setText("AWB")
-            if self.cap is not None:
-                self.cap.set(cv2.CAP_PROP_AUTO_WB, 1)
         else:
-            if self.cap is not None:
-                self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
             self.on_wb_changed(self.slider_wb.value())
 
     def on_wb_changed(self, kelvin):
+        if self.chk_auto_wb.isChecked():
+            self.chk_auto_wb.blockSignals(True)
+            self.chk_auto_wb.setChecked(False)
+            self.chk_auto_wb.blockSignals(False)
+        self.settings["auto_wb"] = False
         self.settings["wb_kelvin"] = kelvin
         self.lbl_wb_val.setText(f"{kelvin}K")
-        hw_ok = False
-        if self.cap is not None and not self.settings["auto_wb"]:
-            hw_ok = self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, float(kelvin))
-        self.settings["use_sw_wb"] = (not self.settings["auto_wb"]) and (not hw_ok)
 
     def reset_hardware_pro(self):
         self.chk_auto_exp.setChecked(True)
         self.chk_auto_foc.setChecked(True)
         self.chk_auto_wb.setChecked(True)
         self.slider_iso.setValue(400)
-        self.settings["sw_iso_mult"] = 1.0
-        self.set_status("Pro Manual settings reset to Auto")
+        self.set_status("Pro Manual controls reset to Auto")
 
     def reset_color_settings(self):
         self.clear_lut()
         self.combo_filter.setCurrentText("Normal")
-        for key, (slider, default_v) in self.sliders.items():
+        for key in ("lut_strength", "zoom", "brightness", "contrast", "saturation", "sharpness"):
+            slider, default_v = self.sliders[key]
             slider.setValue(default_v)
         self.set_status("Color & LUT settings reset")
 
+    # ==========================================
+    # Camera & Top Bar Toggles
+    # ==========================================
     def open_camera(self, index):
         self.frame_timer.stop()
         if self.is_recording:
@@ -1589,6 +1816,7 @@ class ProCameraWindow(QMainWindow):
             self.cap = None
 
         self.camera_index = index
+        self.prev_temporal_frame = None
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not cap.isOpened():
             cap = cv2.VideoCapture(index)
@@ -1605,7 +1833,7 @@ class ProCameraWindow(QMainWindow):
         self.cap = cap
         self.live_buffer.clear()
         aw, ah = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | MVIMG: {'ON' if self.mvimg_single_file else 'OFF'}")
+        self.set_status(f"Camera {index} Ready ({aw}x{ah}) | Clean Denoise ON")
         self.frame_timer.start(30)
 
     def change_resolution(self, idx):
@@ -1614,64 +1842,78 @@ class ProCameraWindow(QMainWindow):
 
     def toggle_live_photo(self, checked):
         self.live_photo_enabled = checked
-        self.btn_live.setText("◉ LIVE ON" if checked else "○ LIVE OFF")
+        self.btn_live.setText("◉ LIVE" if checked else "○ LIVE")
         if not checked:
             self.live_buffer.clear()
 
     def toggle_mvimg_format(self, checked):
         self.mvimg_single_file = checked
-        self.btn_mvimg.setText("MVIMG: ON" if checked else "MVIMG: OFF")
         self.set_status("Output: Single-file MVIMG_*.jpg" if checked else "Output: Paired JPG + MP4")
+
+    def toggle_hdr(self, checked):
+        self.settings["hdr_enabled"] = checked
+        self.set_status("HDR Mode ON (Expanded Dynamic Range)" if checked else "HDR Mode OFF")
+
+    def toggle_clean(self, checked):
+        self.settings["clean_enabled"] = checked
+        self.prev_temporal_frame = None
+        self.set_status("Clean Denoise & Clarity ON" if checked else "Clean Denoise OFF (Raw Sensor)")
 
     def toggle_mic(self, checked):
         if checked:
             ok, msg = self.audio_engine.start()
             self.mic_enabled = ok
             self.btn_mic.setChecked(ok)
-            self.btn_mic.setText("🎙 Mic: ON" if ok else "🔇 Mic: OFF")
+            self.btn_mic.setText("🎙 Mic" if ok else "🔇 Mic")
             self.set_status(msg)
         else:
             self.audio_engine.stop()
             self.mic_enabled = False
-            self.btn_mic.setText("🔇 Mic: OFF")
+            self.btn_mic.setText("🔇 Mic")
             self.set_status("Microphone muted")
 
     def toggle_grid(self, checked):
         self.settings["grid"] = checked
-        self.btn_grid.setText("Grid: ON" if checked else "Grid: OFF")
 
     def toggle_mirror(self, checked):
         self.settings["mirror"] = checked
-        self.btn_mirror.setText("Mirror: ON" if checked else "Mirror: OFF")
+        self.prev_temporal_frame = None
 
     def set_mode(self, mode):
         if self.is_recording:
             self.stop_recording()
         self.mode = mode
+        self.tl_bar.setVisible(mode == "TIMELAPSE")
         if mode == "PRO":
             self.right_tabs.setCurrentIndex(0)
         if mode in ("VIDEO", "TIMELAPSE"):
             self.btn_shutter.setStyleSheet(
-                "background-color: #ff3b30; color: white; border: 4px solid #6a6a7c; border-radius: 34px; font-size: 24px;"
+                "background-color: #ff3b30; color: white; border: 4px solid #6a6a7c; border-radius: 29px; font-size: 20px;"
             )
         else:
             self.btn_shutter.setStyleSheet("")
         self.btn_shutter.setText("●")
-        self.set_status(f"Mode: {mode}")
+        if mode == "TIMELAPSE":
+            self.update_timelapse_settings()
+        else:
+            self.set_status(f"Mode: {mode}")
 
     def set_status(self, text):
         self.status_label.setText(text)
 
+    # ==========================================
+    # Main Frame Loop
+    # ==========================================
     def _build_hud_text(self):
-        if self.mode != "PRO" and self.active_lut is None:
+        if self.mode != "PRO" and self.active_lut is None and not self.settings["hdr_enabled"]:
             return ""
-        ss = "AUTO" if self.settings["auto_exposure"] else f"1/{int(2**abs(self.settings['exposure_ev']))}s"
+        ev_txt = "AUTO" if self.settings["auto_exposure"] else f"{self.settings['ev_offset']:+.1f}EV"
         iso = f"ISO {self.settings['iso_val']}"
-        foc = "AF" if self.settings["auto_focus"] else f"MF {self.settings['focus_val']}"
         wb = "AWB" if self.settings["auto_wb"] else f"{self.settings['wb_kelvin']}K"
-        lut = f"LUT: {self.active_lut.name} ({int(self.settings['lut_strength']*100)}%)" if self.active_lut else "LUT: OFF"
-        fmt = "MVIMG" if self.mvimg_single_file else "JPG+MP4"
-        return f"  {self.mode}  |  SS {ss}  |  {iso}  |  {foc}  |  WB {wb}  |  {lut}  |  {fmt}"
+        hdr = "HDR ON" if self.settings["hdr_enabled"] else "HDR OFF"
+        cln = f"CLEAN {int(self.settings['clean_strength']*100)}%" if self.settings["clean_enabled"] else "RAW"
+        lut = f"LUT: {self.active_lut.name}" if self.active_lut else "LUT: OFF"
+        return f" {self.mode} | EV {ev_txt} | {iso} | WB {wb} | {hdr} | {cln} | {lut}"
 
     def update_frame(self):
         if self.cap is None:
@@ -1681,7 +1923,9 @@ class ProCameraWindow(QMainWindow):
             return
 
         now = time.time()
-        clean_frame = apply_image_pipeline(raw, self.settings, self.active_lut)
+        clean_frame, self.prev_temporal_frame = apply_image_pipeline(
+            raw, self.settings, self.active_lut, self.prev_temporal_frame
+        )
         self.last_clean_frame = clean_frame
 
         if self.mode in ("PHOTO", "PRO") and self.live_photo_enabled:
@@ -1719,7 +1963,8 @@ class ProCameraWindow(QMainWindow):
                     self.video_writer.write(clean_frame)
                     self.timelapse_last_grab = now
                     self.rec_frame_count += 1
-                rec_text = f"TL {mm:02d}:{ss:02d} ({self.rec_frame_count}f)"
+                vid_sec = self.rec_frame_count / max(1.0, self.timelapse_fps)
+                rec_text = f"TL {mm:02d}:{ss:02d} | {self.rec_frame_count}f ({vid_sec:.1f}s)"
 
         if self.flash_alpha > 0.0:
             self.flash_alpha = max(0.0, self.flash_alpha - 0.16)
@@ -1730,6 +1975,9 @@ class ProCameraWindow(QMainWindow):
         )
         self.preview_label.setPixmap(bgr_to_qpixmap(vis, self.preview_label.size()))
 
+    # ==========================================
+    # Capture Actions
+    # ==========================================
     def trigger_shutter(self):
         if self.last_clean_frame is None:
             return
@@ -1758,6 +2006,17 @@ class ProCameraWindow(QMainWindow):
         elif self.mode in ("VIDEO", "TIMELAPSE"):
             self.start_recording()
 
+    def _polish_still_frame(self, frame):
+        """Extra multi-detail polish for saved still photos when Clean mode is active."""
+        if not self.settings["clean_enabled"]:
+            return frame
+        try:
+            # Fast subtle NL-Means denoise for ultra-clean saved stills
+            h_str = max(3, int(6 * self.settings["clean_strength"]))
+            return cv2.fastNlMeansDenoisingColored(frame, None, h_str, h_str, 5, 11)
+        except Exception:
+            return frame
+
     def capture_photo(self, is_live=False, suffix=""):
         if self.last_clean_frame is None:
             return
@@ -1766,9 +2025,6 @@ class ProCameraWindow(QMainWindow):
         self.flash_alpha = 0.75
 
         if is_live:
-            if self.mode == "PRO" and self.settings["save_png"]:
-                cv2.imwrite(os.path.join(DIRS["photos"], f"PRO_{ts}.png"), frame)
-
             if not self.live_post_capturing:
                 now = time.time()
                 prefix = "MVIMG_" if self.mvimg_single_file else "LIVE_"
@@ -1777,7 +2033,11 @@ class ProCameraWindow(QMainWindow):
                 self.live_shutter_ts = now
 
                 if not self.mvimg_single_file:
-                    cv2.imwrite(self.live_base_path + ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 96])
+                    polished = self._polish_still_frame(frame)
+                    cv2.imwrite(self.live_base_path + ".jpg", polished, [cv2.IMWRITE_JPEG_QUALITY, 96])
+
+                if self.mode == "PRO" and self.settings["save_png"]:
+                    cv2.imwrite(os.path.join(DIRS["photos"], f"PRO_{ts}.png"), frame)
 
                 self.live_pre_frames = [
                     (t, f.copy()) for (t, f) in list(self.live_buffer) if t >= now - 1.5
@@ -1789,13 +2049,25 @@ class ProCameraWindow(QMainWindow):
                 self.live_post_capturing = True
                 self.set_status("Capturing MVIMG Motion Photo + Audio (1.5s)...")
         else:
-            if self.mode == "PRO" and self.settings["save_png"]:
-                out_path = os.path.join(DIRS["photos"], f"PRO_{ts}{suffix}.png")
-                cv2.imwrite(out_path, frame)
-            else:
-                out_path = os.path.join(DIRS["photos"], f"IMG_{ts}{suffix}.jpg")
-                cv2.imwrite(out_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 96])
-            self.set_status(f"Saved: {os.path.basename(out_path)}")
+            is_png = (self.mode == "PRO" and self.settings["save_png"])
+            out_path = os.path.join(
+                DIRS["photos"],
+                f"PRO_{ts}{suffix}.png" if is_png else f"IMG_{ts}{suffix}.jpg"
+            )
+            self.set_status("Polishing & saving photo...")
+            threading.Thread(
+                target=self._save_polished_still,
+                args=(frame, out_path, is_png),
+                daemon=True
+            ).start()
+
+    def _save_polished_still(self, frame, out_path, is_png):
+        polished = self._polish_still_frame(frame)
+        if is_png:
+            cv2.imwrite(out_path, polished)
+        else:
+            cv2.imwrite(out_path, polished, [cv2.IMWRITE_JPEG_QUALITY, 96])
+        self.status_signal.emit(f"Saved: {os.path.basename(out_path)}")
 
     def _encode_live_av(self, frames_with_ts, audio_np, still_frame, shutter_ts, base_path, as_mvimg):
         if len(frames_with_ts) < 2:
@@ -1827,7 +2099,8 @@ class ProCameraWindow(QMainWindow):
         if as_mvimg:
             final_mvimg = base_path + ".jpg"
             try:
-                pack_android_motion_photo(still_frame, muxed_mp4, final_mvimg, keyframe_us=keyframe_us)
+                polished_still = self._polish_still_frame(still_frame)
+                pack_android_motion_photo(polished_still, muxed_mp4, final_mvimg, keyframe_us=keyframe_us)
                 self.status_signal.emit(f"Saved Android MVIMG ({tag}): {os.path.basename(final_mvimg)}")
             except Exception as e:
                 self.status_signal.emit(f"MVIMG Error: {e}")
@@ -1866,8 +2139,8 @@ class ProCameraWindow(QMainWindow):
                 self.audio_engine.start_video_recording()
         else:
             self.active_video_path = os.path.join(DIRS["timelapse"], f"TL_{ts}.mp4")
-            self.temp_video_path = ""
-            self.video_writer = cv2.VideoWriter(self.active_video_path, fourcc, 24.0, (w, h))
+            self.temp_video_path = tempfile.mktemp(suffix="_tl.mp4")
+            self.video_writer = cv2.VideoWriter(self.temp_video_path, fourcc, self.timelapse_fps, (w, h))
             self.timelapse_last_grab = 0.0
 
         self.is_recording = True
@@ -1888,19 +2161,24 @@ class ProCameraWindow(QMainWindow):
             self.set_status("Saving Video & syncing audio...")
             threading.Thread(
                 target=self._finalize_video_av,
-                args=(self.temp_video_path, audio_np, self.active_video_path, pts_scale),
+                args=(self.temp_video_path, audio_np, self.active_video_path, pts_scale, "Video"),
                 daemon=True
             ).start()
-        elif self.active_video_path:
-            self.set_status(f"Saved {self.mode}: {os.path.basename(self.active_video_path)}")
+        elif self.mode == "TIMELAPSE" and self.temp_video_path:
+            self.set_status("Encoding H.264 Time-Lapse...")
+            threading.Thread(
+                target=self._finalize_video_av,
+                args=(self.temp_video_path, None, self.active_video_path, 1.0, "Time-Lapse"),
+                daemon=True
+            ).start()
 
-    def _finalize_video_av(self, temp_vid, audio_np, final_mp4, pts_scale):
+    def _finalize_video_av(self, temp_vid, audio_np, final_mp4, pts_scale, label):
         temp_wav = None
         if audio_np is not None and len(audio_np) > 0:
             temp_wav = tempfile.mktemp(suffix="_vid.wav")
             self.audio_engine.save_wav(audio_np, temp_wav)
         mux_video_audio_ffmpeg(temp_vid, temp_wav, final_mp4, pts_scale=pts_scale)
-        self.status_signal.emit(f"Saved Video: {os.path.basename(final_mp4)}")
+        self.status_signal.emit(f"Saved {label}: {os.path.basename(final_mp4)}")
 
     def open_gallery(self):
         dlg = GalleryDialog(self)
@@ -1912,14 +2190,16 @@ class ProCameraWindow(QMainWindow):
             self.trigger_shutter()
         elif key == Qt.Key.Key_L:
             self.btn_live.click()
+        elif key == Qt.Key.Key_H:
+            self.btn_hdr.click()
+        elif key == Qt.Key.Key_D:
+            self.btn_clean.click()
         elif key == Qt.Key.Key_G:
             self.btn_grid.click()
         elif key == Qt.Key.Key_M:
             self.btn_mirror.click()
         elif key == Qt.Key.Key_P:
             self.chk_peaking.setChecked(not self.chk_peaking.isChecked())
-        elif key == Qt.Key.Key_H:
-            self.chk_hist.setChecked(not self.chk_hist.isChecked())
         elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
             slider, _ = self.sliders["zoom"]
             slider.setValue(min(slider.maximum(), slider.value() + 2))
@@ -1964,7 +2244,7 @@ class AnimatedSplashScreen(QWidget):
                     break
 
         self.elapsed = 0.0
-        self.duration = 2.3
+        self.duration = 2.2
         self.progress = 0.0
         self.opacity_val = 0.0
         self.fading_out = False
@@ -2007,9 +2287,9 @@ class AnimatedSplashScreen(QWidget):
         if self.progress < 0.30:
             self.status_text = "Initializing ProCam Engine..."
         elif self.progress < 0.62:
-            self.status_text = "Loading Live Photo Audio & MVIMG..."
+            self.status_text = "Loading HDR, Denoise & MVIMG..."
         elif self.progress < 0.90:
-            self.status_text = "Preparing 3D LUT & Pro Controls..."
+            self.status_text = "Preparing Pro Controls & 3D LUT..."
         else:
             self.status_text = "Starting Camera..."
 
@@ -2036,7 +2316,6 @@ class AnimatedSplashScreen(QWidget):
         clip_path = QPainterPath()
         clip_path.addRoundedRect(rect, 22, 22)
         painter.setClipPath(clip_path)
-
         painter.fillRect(rect, QColor("#0c0d11"))
 
         if self.logo_pix is not None:
@@ -2099,7 +2378,7 @@ class AnimatedSplashScreen(QWidget):
 if __name__ == "__main__":
     if os.name == "nt":
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.1")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProCam.Windows.ByYe.2.2")
 
     app = QApplication(sys.argv)
     icon_file = resource_path("app_icon.ico")
